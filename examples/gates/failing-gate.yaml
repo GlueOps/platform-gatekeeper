@@ -1,0 +1,11 @@
+apiVersion: platform.onglueopshosted.com/v1alpha1
+kind: Gate
+metadata:
+  name: some-name-prod
+  namespace: nonprod
+spec:
+  checks:
+    - id: postgres
+      deploymentAvailable:
+        name: some-name
+        minAvailableReplicas: 1
