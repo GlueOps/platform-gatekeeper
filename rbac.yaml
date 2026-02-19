@@ -1,0 +1,75 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: glueops-core-gatekeeper
+  labels:
+    gatekeeper.platform.onglueopshosted.com/mode: platform
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: glueops-core-gatekeeper
+rules:
+  - apiGroups: ["platform.onglueopshosted.com"]
+    resources: ["gates"]
+    verbs: ["get"]
+
+  - apiGroups: ["platform.onglueopshosted.com"]
+    resources: ["gates/status"]
+    verbs: ["patch","update"]
+
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+
+  # allowlisted reads:
+  - apiGroups: ["apps"]
+    resources: ["deployments","statefulsets"]
+    verbs: ["get"]
+
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get"]
+
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
+
+  - apiGroups: [ "" ]
+    resources: [ "pods" ]
+    verbs: [ "list" ]
+
+  - apiGroups: [ "" ]
+    resources: [ "namespaces" ]
+    verbs: [ "get" ]
+
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["list"]
+
+  - apiGroups: [ "argoproj.io" ]
+    resources: [ "applications" ]
+    verbs: [ "get","list","watch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: glueops-core-gatekeeper
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: glueops-core-gatekeeper
+subjects:
+  - kind: ServiceAccount
+    name: glueops-core-gatekeeper
+    namespace: glueops-core-gatekeeper

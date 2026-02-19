@@ -1,0 +1,11 @@
+apiVersion: platform.onglueopshosted.com/v1alpha1
+kind: Gate
+metadata:
+  name: keycloak-prod
+  namespace: nonprod
+spec:
+  checks:
+    - id: postgres
+      deploymentAvailable:
+        name: keycloak-pg-database-prod
+        minAvailableReplicas: 1

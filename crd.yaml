@@ -1,0 +1,109 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gates.platform.onglueopshosted.com
+spec:
+  group: platform.onglueopshosted.com
+  scope: Namespaced
+  names:
+    plural: gates
+    singular: gate
+    kind: Gate
+    shortNames: ["gate"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["checks"]
+              properties:
+                # Optional: if true, fail when spec references disallowed kinds/targets
+                strict:
+                  type: boolean
+                  default: true
+                  description: "If true, the gate will be marked failed if any checks reference disallowed resource kinds or targets. If false, such checks will be ignored but the gate can still pass if all other checks pass."
+                checks:
+                  type: array
+                  minItems: 1
+                  items:
+                    type: object
+                    required: ["id"]
+                    properties:
+                      id:
+                        type: string
+                        minLength: 1
+                        maxLength: 63
+                      # default namespace is Gate's namespace
+                      namespace:
+                        type: string
+                        minLength: 1
+                        maxLength: 63
+
+                      # Exactly one of these blocks should be set:
+                      deploymentAvailable:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minAvailableReplicas: { type: integer, minimum: 0, default: 1 }
+
+                      statefulSetReady:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minReadyReplicas: { type: integer, minimum: 0, default: 1 }
+                          requireUpdatedRevision: { type: boolean, default: true }
+
+                      jobComplete:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+
+                      serviceReadyEndpoints:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minReadyAddresses: { type: integer, minimum: 0, default: 1 }
+                          # Optional: name/port matching etc. can be added later
+
+                      podLabelReady:
+                        type: object
+                        required: ["selector"]
+                        properties:
+                          selector: { type: string, minLength: 1 } # label selector string
+                          minReadyPods: { type: integer, minimum: 0, default: 1 }
+
+                      argoApplicationHealthy:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          requireSynced: { type: boolean, default: true }
+                          requireHealthy: { type: boolean, default: true }
+
+            status:
+              type: object
+              properties:
+                observedGeneration: { type: integer }
+                ready: { type: boolean }
+                lastEvaluatedTime: { type: string, format: date-time }
+                results:
+                  type: array
+                  items:
+                    type: object
+                    required: ["id", "ready"]
+                    properties:
+                      id: { type: string }
+                      ready: { type: boolean }
+                      message: { type: string }
