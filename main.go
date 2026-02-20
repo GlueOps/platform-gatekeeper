@@ -29,7 +29,7 @@ import (
 )
 
 const (
-	nsModeLabel  = "gatekeeper.platform.onglueopshosted.com/mode" // customer | platform
+	nsModeLabel  = "gatekeeper.platform.glueops.dev/mode" // customer | platform
 	modeCustomer = "customer"
 	modePlatform = "platform"
 	defaultPort  = "8080"
@@ -88,7 +88,7 @@ func main() {
 	}
 
 	gvr := schema.GroupVersionResource{
-		Group:    envOr("GATEKEEPER_GATE_GROUP", "platform.onglueopshosted.com"),
+		Group:    envOr("GATEKEEPER_GATE_GROUP", "platform.glueops.dev"),
 		Version:  envOr("GATEKEEPER_GATE_VERSION", "v1alpha1"),
 		Resource: envOr("GATEKEEPER_GATE_RESOURCE", "gates"),
 	}

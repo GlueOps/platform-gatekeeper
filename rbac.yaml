@@ -3,7 +3,7 @@ kind: Namespace
 metadata:
   name: glueops-core-gatekeeper
   labels:
-    gatekeeper.platform.onglueopshosted.com/mode: platform
+    gatekeeper.platform.glueops.dev/mode: platform
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -16,11 +16,11 @@ kind: ClusterRole
 metadata:
   name: glueops-core-gatekeeper
 rules:
-  - apiGroups: ["platform.onglueopshosted.com"]
+  - apiGroups: ["platform.glueops.dev"]
     resources: ["gates"]
     verbs: ["get"]
 
-  - apiGroups: ["platform.onglueopshosted.com"]
+  - apiGroups: ["platform.glueops.dev"]
     resources: ["gates/status"]
     verbs: ["patch","update"]
 
