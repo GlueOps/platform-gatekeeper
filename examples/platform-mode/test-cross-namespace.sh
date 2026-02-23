@@ -17,7 +17,7 @@ GATE_NAMESPACE="nonprod"
 # First, let's create a test gate that references cross-namespace deployment
 echo "Creating temporary gate for cross-namespace test..."
 cat <<EOF | kubectl apply -f -
-apiVersion: platform.onglueopshosted.com/v1alpha1
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: ${GATE_NAME}

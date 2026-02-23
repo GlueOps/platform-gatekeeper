@@ -13,8 +13,8 @@ Key properties:
 - **AuthN**: Kubernetes `TokenReview` of a bearer token (typically a ServiceAccount token).
 - **AuthZ**: Kubernetes `SubjectAccessReview` for each requested action (delegated authorization).
 - **Policy modes**: Determined by a namespace label:
-  - `gatekeeper.platform.onglueopshosted.com/mode=customer|platform`
-- **Gate source of truth**: A namespaced `Gate` custom resource (`platform.onglueopshosted.com/v1alpha1`).
+  - `gatekeeper.platform.glueops.dev/mode=customer|platform`
+- **Gate source of truth**: A namespaced `Gate` custom resource (`platform.glueops.dev/v1alpha1`).
 - **Checks**: Allowlisted resource checks (Deployment, StatefulSet, Job, Service endpoints, Pod selector, etc).
 - **Expected client**: An Argo CD PreSync hook Job (or similar) that polls until 200 OK.
 
@@ -43,7 +43,7 @@ Key properties:
 ## Kubernetes model
 
 ### Gate CRD
-- Group/version: `platform.onglueopshosted.com/v1alpha1`
+- Group/version: `platform.glueops.dev/v1alpha1`
 - Kind: `Gate`
 - Scope: Namespaced
 - Gate status is updated using the CRD status subresource (`gates/status`).
@@ -54,7 +54,7 @@ Key properties:
 Mode is determined from the **caller namespace** label:
 
 ```yaml
-gatekeeper.platform.onglueopshosted.com/mode: customer|platform
+gatekeeper.platform.glueops.dev/mode: customer|platform
 ```
 
 ### Expected behavior:

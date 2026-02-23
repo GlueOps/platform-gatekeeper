@@ -1,4 +1,4 @@
-apiVersion: platform.onglueopshosted.com/v1alpha1
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: keycloak-prod

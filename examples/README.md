@@ -41,7 +41,7 @@ Before running the test scripts, ensure you have:
    ```bash
    # Platform mode namespace
    kubectl create namespace glueops-core-gatekeeper
-   kubectl label namespace glueops-core-gatekeeper gatekeeper.platform.onglueopshosted.com/mode=platform
+   kubectl label namespace glueops-core-gatekeeper gatekeeper.platform.glueops.dev/mode=platform
 
    # Customer mode namespace (no label needed, defaults to customer)
    kubectl create namespace nonprod
@@ -75,7 +75,7 @@ Before running the test scripts, ensure you have:
 This gate checks for a deployment that should exist in your test environment:
 
 ```yaml
-apiVersion: platform.onglueopshosted.com/v1alpha1
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: keycloak-prod
@@ -98,7 +98,7 @@ kubectl apply -f examples/gates/passing-gate.yaml
 This gate checks for a deployment that doesn't exist:
 
 ```yaml
-apiVersion: platform.onglueopshosted.com/v1alpha1
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: some-name-prod
@@ -291,7 +291,7 @@ kubectl get namespace nonprod -o jsonpath='{.metadata.labels}'
 
 The `glueops-core-gatekeeper` namespace should have:
 ```
-gatekeeper.platform.onglueopshosted.com/mode: platform
+gatekeeper.platform.glueops.dev/mode: platform
 ```
 
 The `nonprod` namespace should NOT have this label (defaults to customer mode).

@@ -74,7 +74,7 @@ Gatekeeper supports configuration via environment variables.
 ### Gate CRD location
 | Env var                    | Default                        | Description               |
 | -------------------------- | ------------------------------ | ------------------------- |
-| `GATEKEEPER_GATE_GROUP`    | `platform.onglueopshosted.com` | API group of the Gate CRD |
+| `GATEKEEPER_GATE_GROUP`    | `platform.glueops.dev` | API group of the Gate CRD |
 | `GATEKEEPER_GATE_VERSION`  | `v1alpha1`                     | API version               |
 | `GATEKEEPER_GATE_RESOURCE` | `gates`                        | plural resource name      |
 
@@ -99,7 +99,7 @@ Gatekeeper chooses the mode based on a label on the caller’s namespace:
 
 Label key:
 ```yaml
-gatekeeper.platform.onglueopshosted.com/mode: customer|platform
+gatekeeper.platform.glueops.dev/mode: customer|platform
 ```
 
 ### customer mode (default)
@@ -124,7 +124,7 @@ A Gate defines a list of checks. Each check must set exactly one check type.
 
 Example:
 ```yaml
-apiVersion: platform.onglueopshosted.com/v1alpha1
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: keycloak-prod
