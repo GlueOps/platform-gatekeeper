@@ -525,7 +525,11 @@ func (s *Server) evalOne(ctx context.Context, caller *Caller, ns string, check m
 		return false, fmt.Sprintf("ready pods %d < %d", readyCount, minReady), nil, nil
 	}
 
-	if block, ok := check["argoApplicationHealthy"].(map[string]any); ok {
+	if raw, exists := check["argoApplicationHealthy"]; exists {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			return false, "", errors.New("argoApplicationHealthy must be an object"), nil
+		}
 		name := strOr(block["name"], "")
 		if name == "" {
 			return false, "", errors.New("argoApplicationHealthy.name required"), nil
@@ -598,25 +602,42 @@ func jobComplete(j *batchv1.Job) (bool, string, error, error) {
 }
 
 func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (bool, string, error, error) {
-	healthStatus, _, _ := unstructured.NestedString(app.Object, "status", "health", "status")
-	syncStatus, _, _ := unstructured.NestedString(app.Object, "status", "sync", "status")
-
-	if requireHealthy && healthStatus != "Healthy" {
-		return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), nil, nil
+	if requireHealthy {
+		healthStatus, found, err := unstructured.NestedString(app.Object, "status", "health", "status")
+		if err != nil {
+			return false, "", fmt.Errorf("status.health.status has unexpected type: %w", err), nil
+		}
+		if !found {
+			return false, "status.health.status not present (application may still be initializing)", nil, nil
+		}
+		if healthStatus != "Healthy" {
+			return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), nil, nil
+		}
 	}
-	if requireSynced && syncStatus != "Synced" {
-		return false, fmt.Sprintf("sync status is %q, want Synced", syncStatus), nil, nil
+
+	if requireSynced {
+		syncStatus, found, err := unstructured.NestedString(app.Object, "status", "sync", "status")
+		if err != nil {
+			return false, "", fmt.Errorf("status.sync.status has unexpected type: %w", err), nil
+		}
+		if !found {
+			return false, "status.sync.status not present (application may still be initializing)", nil, nil
+		}
+		if syncStatus != "Synced" {
+			return false, fmt.Sprintf("sync status is %q, want Synced", syncStatus), nil, nil
+		}
 	}
 
-	parts := []string{}
+	if !requireHealthy && !requireSynced {
+		return true, "no conditions required", nil, nil
+	}
+
+	var parts []string
 	if requireHealthy {
 		parts = append(parts, "Healthy")
 	}
 	if requireSynced {
 		parts = append(parts, "Synced")
-	}
-	if len(parts) == 0 {
-		return true, "no conditions required", nil, nil
 	}
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), nil, nil
 }

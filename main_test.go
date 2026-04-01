@@ -298,23 +298,56 @@ func TestArgoAppReady(t *testing.T) {
 		requireSynced  bool
 		requireHealthy bool
 		wantReady      bool
+		wantSpecErr    bool
 	}{
-		{"healthy and synced", makeApp("Healthy", "Synced"), true, true, true},
-		{"healthy not synced", makeApp("Healthy", "OutOfSync"), true, true, false},
-		{"not healthy but synced", makeApp("Degraded", "Synced"), true, true, false},
-		{"healthy only required", makeApp("Healthy", "OutOfSync"), false, true, true},
-		{"synced only required", makeApp("Degraded", "Synced"), true, false, true},
-		{"neither required", makeApp("Degraded", "OutOfSync"), false, false, true},
-		{"no status at all", makeApp("", ""), true, true, false},
+		{"healthy and synced", makeApp("Healthy", "Synced"), true, true, true, false},
+		{"healthy not synced", makeApp("Healthy", "OutOfSync"), true, true, false, false},
+		{"not healthy but synced", makeApp("Degraded", "Synced"), true, true, false, false},
+		{"healthy only required", makeApp("Healthy", "OutOfSync"), false, true, true, false},
+		{"synced only required", makeApp("Degraded", "Synced"), true, false, true, false},
+		{"neither required", makeApp("Degraded", "OutOfSync"), false, false, true, false},
+		{"no status at all", makeApp("", ""), true, true, false, false},
+		{"health missing sync present", makeApp("", "Synced"), true, true, false, false},
+		{"health present sync missing", makeApp("Healthy", ""), true, true, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ready, _, _, _ := argoAppReady(tt.app, tt.requireSynced, tt.requireHealthy)
+			ready, _, specErr, _ := argoAppReady(tt.app, tt.requireSynced, tt.requireHealthy)
 			if ready != tt.wantReady {
 				t.Errorf("argoAppReady() ready = %v, want %v", ready, tt.wantReady)
 			}
+			if (specErr != nil) != tt.wantSpecErr {
+				t.Errorf("argoAppReady() specErr = %v, wantSpecErr %v", specErr, tt.wantSpecErr)
+			}
 		})
 	}
+
+	// Test invalid type in status fields
+	t.Run("health status wrong type", func(t *testing.T) {
+		app := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"health": map[string]any{"status": 123},
+				"sync":   map[string]any{"status": "Synced"},
+			},
+		}}
+		_, _, specErr, _ := argoAppReady(app, true, true)
+		if specErr == nil {
+			t.Error("expected specErr for non-string health status")
+		}
+	})
+
+	t.Run("sync status wrong type", func(t *testing.T) {
+		app := &unstructured.Unstructured{Object: map[string]any{
+			"status": map[string]any{
+				"health": map[string]any{"status": "Healthy"},
+				"sync":   map[string]any{"status": []string{"Synced"}},
+			},
+		}}
+		_, _, specErr, _ := argoAppReady(app, true, false)
+		if specErr == nil {
+			t.Error("expected specErr for non-string sync status")
+		}
+	})
 }
 
 // --- podReady ---

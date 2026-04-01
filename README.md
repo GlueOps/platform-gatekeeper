@@ -433,8 +433,8 @@ spec:
                 echo "All datasources ready, proceeding with Grafana deployment"
                 exit 0
               elif [ "$HTTP_CODE" = "409" ]; then
-                READY=$(grep -o ‘"ready":true’ /tmp/response.json | wc -l)
-                TOTAL=$(grep -o ‘"ready":’ /tmp/response.json | wc -l)
+                READY=$(jq ‘[.results[] | select(.ready == true)] | length’ /tmp/response.json)
+                TOTAL=$(jq ‘.results | length’ /tmp/response.json)
                 echo "[$ATTEMPT/$MAX_ATTEMPTS] $READY/$TOTAL checks ready, waiting 15s..."
                 sleep 15
               else
