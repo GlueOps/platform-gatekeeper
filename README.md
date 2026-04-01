@@ -1,5 +1,5 @@
 # GlueOps Core Gatekeeper
-<img width="960" height="1088" alt="Gemini_Generated_Image_4z69mb4z69mb4z69" src="https://github.com/user-attachments/assets/2685397d-4055-4678-9601-908b4c827cf4" />
+<img width="960" height="1088" alt="Gatekeeper" src="gatekeeper.png" />
 
 GlueOps Core Gatekeeper is a small Go HTTP service that acts as a **deployment dependency gate** for Kubernetes.
 
