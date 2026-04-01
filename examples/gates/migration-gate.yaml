@@ -1,0 +1,16 @@
+apiVersion: platform.glueops.dev/v1alpha1
+kind: Gate
+metadata:
+  name: my-app-ready
+  namespace: nonprod
+spec:
+  strict: true
+  checks:
+    - id: database
+      statefulSetReady:
+        name: postgres
+        minReadyReplicas: 1
+        requireUpdatedRevision: true
+    - id: migration
+      jobComplete:
+        name: my-app-migrate

@@ -1,0 +1,24 @@
+apiVersion: platform.glueops.dev/v1alpha1
+kind: Gate
+metadata:
+  name: observability-stack-complete
+  namespace: glueops-core-gatekeeper
+spec:
+  strict: true
+  checks:
+    - id: prometheus
+      argoApplicationHealthy:
+        name: prometheus
+      namespace: glueops-core-kube-prometheus-stack
+    - id: thanos
+      argoApplicationHealthy:
+        name: thanos
+      namespace: glueops-core-thanos
+    - id: tempo
+      argoApplicationHealthy:
+        name: tempo
+      namespace: glueops-core-tempo
+    - id: loki
+      argoApplicationHealthy:
+        name: loki
+      namespace: glueops-core-loki

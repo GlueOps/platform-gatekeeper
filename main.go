@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/joho/godotenv"
 	appsv1 "k8s.io/api/apps/v1"
 	authv1 "k8s.io/api/authentication/v1"
 	authzv1 "k8s.io/api/authorization/v1"
@@ -25,7 +26,6 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"github.com/joho/godotenv"
 )
 
 const (
@@ -48,7 +48,6 @@ type Server struct {
 }
 
 type Caller struct {
-	Token  string
 	User   string
 	Groups []string
 	Extra  map[string]authv1.ExtraValue
@@ -71,7 +70,6 @@ type EvalResponse struct {
 
 func main() {
 	_ = godotenv.Load()
-  	
 
 	cfg, err := loadKubeConfig()
 	if err != nil {
@@ -97,10 +95,10 @@ func main() {
 	prefixes := parseCSVList(envOr("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES", "glueops-core-"))
 
 	s := &Server{
-		kube:                   kube,
-		dyn:                    dyn,
-		gateGVR:                gvr,
-		platformAllowedNS:      allowed,
+		kube:                    kube,
+		dyn:                     dyn,
+		gateGVR:                 gvr,
+		platformAllowedNS:       allowed,
 		platformAllowedPrefixes: prefixes,
 	}
 
@@ -190,7 +188,9 @@ func (s *Server) handleCheck(always200 bool) http.HandlerFunc {
 		}
 
 		// Update Gate.status best-effort (does not change response)
-		_ = s.updateGateStatus(ctx, gateNS, gateObj, ready, results)
+		if err := s.updateGateStatus(ctx, gateNS, gateObj, ready, results); err != nil {
+			log.Printf("warning: failed to update gate status %s/%s: %v", gateNS, gateName, err)
+		}
 
 		// Return
 		if evalErr != nil {
@@ -208,7 +208,9 @@ func (s *Server) handleCheck(always200 bool) http.HandlerFunc {
 		w.WriteHeader(status)
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
-		_ = enc.Encode(resp)
+		if err := enc.Encode(resp); err != nil {
+			log.Printf("warning: failed to encode response: %v", err)
+		}
 	}
 }
 
@@ -239,7 +241,6 @@ func (s *Server) authenticate(ctx context.Context, r *http.Request) (*Caller, er
 	}
 
 	return &Caller{
-		Token:  token,
 		User:   user,
 		Groups: out.Status.User.Groups,
 		Extra:  out.Status.User.Extra,
@@ -255,7 +256,7 @@ func namespaceFromSAUser(username string) (string, error) {
 	}
 	remaining := strings.TrimPrefix(username, prefix)
 	parts := strings.Split(remaining, ":")
-	if len(parts) != 2 || parts[0] == "" {
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", errors.New("bad serviceaccount username")
 	}
 	return parts[0], nil
@@ -524,10 +525,29 @@ func (s *Server) evalOne(ctx context.Context, caller *Caller, ns string, check m
 		return false, fmt.Sprintf("ready pods %d < %d", readyCount, minReady), nil, nil
 	}
 
-	// NOTE: argoApplicationHealthy exists in the CRD but is not implemented in this file.
-	// Add it when you’re ready; until then, leave it out of Gate specs.
-	if _, ok := check["argoApplicationHealthy"]; ok {
-		return false, "", errors.New("argoApplicationHealthy not implemented"), nil
+	if block, ok := check["argoApplicationHealthy"].(map[string]any); ok {
+		name := strOr(block["name"], "")
+		if name == "" {
+			return false, "", errors.New("argoApplicationHealthy.name required"), nil
+		}
+		requireSynced := boolOr(block["requireSynced"], true)
+		requireHealthy := boolOr(block["requireHealthy"], true)
+
+		argoGVR := schema.GroupVersionResource{
+			Group:    "argoproj.io",
+			Version:  "v1alpha1",
+			Resource: "applications",
+		}
+
+		if err := s.requireSAR(ctx, caller, ns, argoGVR.Group, argoGVR.Resource, "get", name); err != nil {
+			return false, "", nil, err
+		}
+
+		app, err := s.dyn.Resource(argoGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Sprintf("argo application get failed: %v", err), nil, nil
+		}
+		return argoAppReady(app, requireSynced, requireHealthy)
 	}
 
 	return false, "", errors.New("no recognized check type set"), nil
@@ -575,6 +595,30 @@ func jobComplete(j *batchv1.Job) (bool, string, error, error) {
 		}
 	}
 	return false, "job not complete yet", nil, nil
+}
+
+func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (bool, string, error, error) {
+	healthStatus, _, _ := unstructured.NestedString(app.Object, "status", "health", "status")
+	syncStatus, _, _ := unstructured.NestedString(app.Object, "status", "sync", "status")
+
+	if requireHealthy && healthStatus != "Healthy" {
+		return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), nil, nil
+	}
+	if requireSynced && syncStatus != "Synced" {
+		return false, fmt.Sprintf("sync status is %q, want Synced", syncStatus), nil, nil
+	}
+
+	parts := []string{}
+	if requireHealthy {
+		parts = append(parts, "Healthy")
+	}
+	if requireSynced {
+		parts = append(parts, "Synced")
+	}
+	if len(parts) == 0 {
+		return true, "no conditions required", nil, nil
+	}
+	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), nil, nil
 }
 
 func podReady(p *corev1.Pod) bool {
@@ -668,9 +712,12 @@ func (s *Server) updateGateStatus(ctx context.Context, ns string, gate *unstruct
 	}
 
 	patch := map[string]any{"status": status}
-	b, _ := json.Marshal(patch)
+	b, err := json.Marshal(patch)
+	if err != nil {
+		return fmt.Errorf("marshal status patch: %w", err)
+	}
 
-	_, err := s.dyn.Resource(s.gateGVR).Namespace(ns).Patch(
+	_, err = s.dyn.Resource(s.gateGVR).Namespace(ns).Patch(
 		ctx,
 		gate.GetName(),
 		types.MergePatchType,
