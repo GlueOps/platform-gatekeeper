@@ -1,0 +1,31 @@
+apiVersion: platform.glueops.dev/v1alpha1
+kind: Gate
+metadata:
+  name: full-stack-ready
+  namespace: nonprod
+spec:
+  strict: true
+  checks:
+    - id: database
+      statefulSetReady:
+        name: postgres
+        minReadyReplicas: 1
+        requireUpdatedRevision: true
+    - id: migration
+      jobComplete:
+        name: db-migrate
+    - id: cache
+      serviceReadyEndpoints:
+        name: redis
+        minReadyAddresses: 1
+    - id: api
+      deploymentAvailable:
+        name: api-server
+        minAvailableReplicas: 2
+    - id: workers
+      podLabelReady:
+        selector: "app=worker"
+        minReadyPods: 3
+    - id: monitoring
+      argoApplicationHealthy:
+        name: monitoring-stack

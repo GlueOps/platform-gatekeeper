@@ -15,8 +15,15 @@ Key properties:
 - **Policy modes**: Determined by a namespace label:
   - `gatekeeper.platform.glueops.dev/mode=customer|platform`
 - **Gate source of truth**: A namespaced `Gate` custom resource (`platform.glueops.dev/v1alpha1`).
-- **Checks**: Allowlisted resource checks (Deployment, StatefulSet, Job, Service endpoints, Pod selector, etc).
+- **Checks**: Allowlisted resource checks:
+  - `deploymentAvailable` — Deployment Available condition + min replicas (`get` on `apps/deployments`)
+  - `statefulSetReady` — StatefulSet ready replicas + optional revision check (`get` on `apps/statefulsets`)
+  - `jobComplete` — Job Complete condition (`get` on `batch/jobs`)
+  - `serviceReadyEndpoints` — Service endpoint addresses via EndpointSlices (`get` on `services`, `list` on `discovery.k8s.io/endpointslices`)
+  - `podLabelReady` — Pod count by label selector (`list` on `pods`)
+  - `argoApplicationHealthy` — Argo CD Application health/sync status (`get` on `argoproj.io/applications`)
 - **Expected client**: An Argo CD PreSync hook Job (or similar) that polls until 200 OK.
+- **RBAC model**: Gatekeeper only needs `get` per named resource and `list` for collections. No `list`/`watch` needed for named lookups. Caller SAs need matching RBAC for the specific check types used in their Gate.
 
 ---
 
@@ -93,13 +100,28 @@ Platform mode uses allow rules based on:
 5. Avoid data leakage
   - Never return resource contents. Return only readiness booleans and human-safe messages.
 
+## Usage patterns
+
+Common Gate patterns (see README.md for full examples with YAML):
+- **Simple dependency**: Gate with `deploymentAvailable` to wait for a database before deploying an app
+- **Migration gate**: Combine `statefulSetReady` + `jobComplete` to wait for DB + migration
+- **Service readiness**: Use `serviceReadyEndpoints` and `podLabelReady` to wait for backing services
+- **Cross-namespace platform gate**: Use `argoApplicationHealthy` with `namespace` overrides to gate on an observability stack across platform namespaces (requires platform mode)
+- **Mixed checks**: A single Gate can combine any check types; each check must set exactly one type
+
+Key design point: Gatekeeper fetches each resource by name — it does **not** list or watch. The Gate CR is the source of truth for what to check. Caller SAs only need `get` (for named resources) or `list` (for pod/endpointslice collection queries).
+
 ## Development workflows
 ### Local run
 - go run . uses:
   - in-cluster config if available
   - otherwise falls back to KUBECONFIG
 
-### Testing tips
+### Testing
+- Unit tests: `go test ./...`
+- Integration tests: see `examples/` directory
+
+### Manual testing tips
  - Use curl -i when debugging to see non-JSON error bodies and HTTP status.
  - To simulate a real client:
     - create a ServiceAccount token with kubectl create token
@@ -124,7 +146,6 @@ Platform mode uses allow rules based on:
 - Structured JSON error responses
 - Metrics endpoint (/metrics) with Prometheus counters
 - Admission validation for Gate objects (reject unsafe specs at creation time)
-- Implement argoApplicationHealthy check type (if required) using allowlisted access
 
 ## Contact / ownership
 - Maintained by GlueOps core platform team.
