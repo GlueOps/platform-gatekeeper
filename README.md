@@ -411,11 +411,12 @@ spec:
       restartPolicy: OnFailure
       containers:
       - name: wait
-        image: curlimages/curl:8.5.0
+        image: alpine:3.21
         command: ["/bin/sh", "-c"]
         args:
           - |
             set -e
+            apk add --no-cache curl jq >/dev/null 2>&1
             TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
             GATEKEEPER_URL="http://gatekeeper.glueops-core-gatekeeper.svc.cluster.local:8080"
             GATE_NAME="observability-stack-complete"
