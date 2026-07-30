@@ -402,6 +402,7 @@ func countCheckTypes(m map[string]any) int {
 		"serviceReadyEndpoints",
 		"podLabelReady",
 		"argoApplicationHealthy",
+		"fluxHelmReleaseReady",
 	}
 	n := 0
 	for _, k := range keys {
@@ -554,6 +555,34 @@ func (s *Server) evalOne(ctx context.Context, caller *Caller, ns string, check m
 		return argoAppReady(app, requireSynced, requireHealthy)
 	}
 
+	if raw, exists := check["fluxHelmReleaseReady"]; exists {
+		block, ok := raw.(map[string]any)
+		if !ok {
+			return false, "", errors.New("fluxHelmReleaseReady must be an object"), nil
+		}
+		name := strOr(block["name"], "")
+		if name == "" {
+			return false, "", errors.New("fluxHelmReleaseReady.name required"), nil
+		}
+		requireCurrentGeneration := boolOr(block["requireCurrentGeneration"], true)
+
+		hrGVR := schema.GroupVersionResource{
+			Group:    "helm.toolkit.fluxcd.io",
+			Version:  "v2",
+			Resource: "helmreleases",
+		}
+
+		if err := s.requireSAR(ctx, caller, ns, hrGVR.Group, hrGVR.Resource, "get", name); err != nil {
+			return false, "", nil, err
+		}
+
+		hr, err := s.dyn.Resource(hrGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return false, fmt.Sprintf("flux helmrelease get failed: %v", err), nil, nil
+		}
+		return fluxHelmReleaseReady(hr, requireCurrentGeneration)
+	}
+
 	return false, "", errors.New("no recognized check type set"), nil
 }
 
@@ -640,6 +669,90 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 		parts = append(parts, "Synced")
 	}
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), nil, nil
+}
+
+// fluxHelmReleaseReady evaluates a Flux helm.toolkit.fluxcd.io/v2 HelmRelease.
+//
+// Why this exists rather than pointing deploymentAvailable at the workload the
+// HelmRelease manages: a Deployment check reads whatever is currently in the cluster,
+// so during a failed upgrade it happily reports Ready against the *previous* revision's
+// pods while the release behind them is broken. That is a false green on precisely the
+// failure this check is for.
+//
+// Two conditions are evaluated, in this order:
+//
+//  1. Generation currency. helm-controller writes status.observedGeneration when it has
+//     acted on the current spec. If it lags metadata.generation the Ready condition
+//     describes an older revision and must not be trusted. Flux uses -1 for "never
+//     reconciled". Callers that genuinely want the last-known state regardless can set
+//     requireCurrentGeneration: false.
+//
+//  2. Stalled. When helm-controller exhausts spec.upgrade.remediation.retries it sets
+//     Stalled=True and stops retrying until the spec, values or chart version change --
+//     an interval tick does not clear it. This is reported separately from a plain
+//     not-Ready because the two need different responses: not-Ready means keep polling,
+//     Stalled means a human has to run `flux reconcile helmrelease <name> --reset`. A
+//     poller that cannot tell them apart burns its whole timeout on a release that was
+//     never going to recover.
+func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneration bool) (bool, string, error, error) {
+	if requireCurrentGeneration {
+		gen, genFound, err := unstructured.NestedInt64(hr.Object, "metadata", "generation")
+		if err != nil {
+			return false, "", fmt.Errorf("metadata.generation has unexpected type: %w", err), nil
+		}
+		observed, obsFound, err := unstructured.NestedInt64(hr.Object, "status", "observedGeneration")
+		if err != nil {
+			return false, "", fmt.Errorf("status.observedGeneration has unexpected type: %w", err), nil
+		}
+		if !obsFound || observed < 0 {
+			return false, "status.observedGeneration not set (helmrelease not yet reconciled)", nil, nil
+		}
+		if genFound && observed < gen {
+			return false, fmt.Sprintf("status.observedGeneration %d behind metadata.generation %d (reconcile in progress)", observed, gen), nil, nil
+		}
+	}
+
+	conds, found, err := unstructured.NestedSlice(hr.Object, "status", "conditions")
+	if err != nil {
+		return false, "", fmt.Errorf("status.conditions has unexpected type: %w", err), nil
+	}
+	if !found || len(conds) == 0 {
+		return false, "status.conditions not present (helmrelease may still be initializing)", nil, nil
+	}
+
+	condStatus := func(want string) (string, string, bool) {
+		for _, raw := range conds {
+			c, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if strOr(c["type"], "") != want {
+				continue
+			}
+			return strOr(c["status"], ""), strOr(c["message"], ""), true
+		}
+		return "", "", false
+	}
+
+	// Stalled is checked before Ready so the message says why, not just "not ready".
+	if status, msg, ok := condStatus("Stalled"); ok && status == "True" {
+		if msg != "" {
+			return false, "helmrelease Stalled=True (will not retry until spec changes): " + msg, nil, nil
+		}
+		return false, "helmrelease Stalled=True (will not retry until spec changes)", nil, nil
+	}
+
+	status, msg, ok := condStatus("Ready")
+	if !ok {
+		return false, "no Ready condition present (helmrelease may still be initializing)", nil, nil
+	}
+	if status != "True" {
+		if msg != "" {
+			return false, fmt.Sprintf("Ready=%s: %s", status, msg), nil, nil
+		}
+		return false, fmt.Sprintf("Ready=%s", status), nil, nil
+	}
+	return true, "helmrelease Ready=True", nil, nil
 }
 
 func podReady(p *corev1.Pod) bool {

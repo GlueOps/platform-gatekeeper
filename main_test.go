@@ -1,6 +1,7 @@
 package main
 
 import (
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -350,6 +351,132 @@ func TestArgoAppReady(t *testing.T) {
 	})
 }
 
+// --- fluxHelmReleaseReady ---
+
+func TestFluxHelmReleaseReady(t *testing.T) {
+	// generation/observedGeneration are omitted when < 0 so the "never reconciled"
+	// path can be exercised; conds of nil means status.conditions is absent entirely.
+	makeHR := func(generation, observed int64, conds []any) *unstructured.Unstructured {
+		obj := &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"generation": generation},
+		}}
+		status := map[string]any{}
+		if observed >= 0 {
+			status["observedGeneration"] = observed
+		}
+		if conds != nil {
+			status["conditions"] = conds
+		}
+		if len(status) > 0 {
+			obj.Object["status"] = status
+		}
+		return obj
+	}
+	cond := func(t, s, m string) any {
+		return map[string]any{"type": t, "status": s, "message": m}
+	}
+	ready := []any{cond("Ready", "True", "Helm install succeeded")}
+	notReady := []any{cond("Ready", "False", "install retries exhausted")}
+	stalled := []any{
+		cond("Ready", "False", "install retries exhausted"),
+		cond("Stalled", "True", "exhausted 3 retries"),
+	}
+
+	tests := []struct {
+		name        string
+		hr          *unstructured.Unstructured
+		requireGen  bool
+		wantReady   bool
+		wantSpecErr bool
+	}{
+		{"ready and current", makeHR(3, 3, ready), true, true, false},
+		{"ready, generation lagging", makeHR(4, 3, ready), true, false, false},
+		{"ready, lagging but currency not required", makeHR(4, 3, ready), false, true, false},
+		{"observedGeneration ahead (controller raced)", makeHR(3, 4, ready), true, true, false},
+		{"never reconciled", makeHR(1, -1, nil), true, false, false},
+		{"never reconciled, currency not required", makeHR(1, -1, nil), false, false, false},
+		{"reconciled but no conditions yet", makeHR(1, 1, nil), true, false, false},
+		{"empty conditions slice", makeHR(1, 1, []any{}), true, false, false},
+		{"not ready", makeHR(1, 1, notReady), true, false, false},
+		{"stalled", makeHR(1, 1, stalled), true, false, false},
+		{"conditions present but no Ready", makeHR(1, 1, []any{cond("Released", "True", "")}), true, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, specErr, _ := fluxHelmReleaseReady(tt.hr, tt.requireGen)
+			if got != tt.wantReady {
+				t.Errorf("fluxHelmReleaseReady() ready = %v, want %v", got, tt.wantReady)
+			}
+			if (specErr != nil) != tt.wantSpecErr {
+				t.Errorf("fluxHelmReleaseReady() specErr = %v, wantSpecErr %v", specErr, tt.wantSpecErr)
+			}
+		})
+	}
+
+	// Stalled must be distinguishable from a plain not-Ready: a poller that cannot
+	// tell them apart burns its whole timeout on a release that will never recover.
+	t.Run("stalled message names the condition", func(t *testing.T) {
+		_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, stalled), true)
+		if !strings.Contains(msg, "Stalled=True") {
+			t.Errorf("stalled message = %q, want it to mention Stalled=True", msg)
+		}
+		if !strings.Contains(msg, "exhausted 3 retries") {
+			t.Errorf("stalled message = %q, want the controller message included", msg)
+		}
+	})
+
+	t.Run("not-ready message carries the controller message", func(t *testing.T) {
+		_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, notReady), true)
+		if !strings.Contains(msg, "install retries exhausted") {
+			t.Errorf("not-ready message = %q, want the controller message included", msg)
+		}
+		if strings.Contains(msg, "Stalled") {
+			t.Errorf("not-ready message = %q, must not claim Stalled", msg)
+		}
+	})
+
+	t.Run("lagging generation is reported as in-progress, not failed", func(t *testing.T) {
+		_, msg, _, _ := fluxHelmReleaseReady(makeHR(4, 3, ready), true)
+		if !strings.Contains(msg, "reconcile in progress") {
+			t.Errorf("lagging message = %q, want it to say reconcile in progress", msg)
+		}
+	})
+
+	t.Run("observedGeneration wrong type", func(t *testing.T) {
+		hr := &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"generation": int64(1)},
+			"status":   map[string]any{"observedGeneration": "nope"},
+		}}
+		if _, _, specErr, _ := fluxHelmReleaseReady(hr, true); specErr == nil {
+			t.Error("expected specErr for non-integer observedGeneration")
+		}
+	})
+
+	t.Run("conditions wrong type", func(t *testing.T) {
+		hr := &unstructured.Unstructured{Object: map[string]any{
+			"metadata": map[string]any{"generation": int64(1)},
+			"status": map[string]any{
+				"observedGeneration": int64(1),
+				"conditions":         "not-a-slice",
+			},
+		}}
+		if _, _, specErr, _ := fluxHelmReleaseReady(hr, true); specErr == nil {
+			t.Error("expected specErr for non-slice conditions")
+		}
+	})
+
+	t.Run("malformed condition entries are skipped, not fatal", func(t *testing.T) {
+		hr := makeHR(1, 1, []any{"garbage", cond("Ready", "True", "")})
+		got, _, specErr, _ := fluxHelmReleaseReady(hr, true)
+		if specErr != nil {
+			t.Errorf("unexpected specErr: %v", specErr)
+		}
+		if !got {
+			t.Error("expected ready despite a malformed sibling condition entry")
+		}
+	})
+}
+
 // --- podReady ---
 
 func TestPodReady(t *testing.T) {
@@ -467,7 +594,8 @@ func TestCountCheckTypes(t *testing.T) {
 			"serviceReadyEndpoints":  map[string]any{},
 			"podLabelReady":          map[string]any{},
 			"argoApplicationHealthy": map[string]any{},
-		}, 6},
+			"fluxHelmReleaseReady":   map[string]any{},
+		}, 7},
 		{"unknown key ignored", map[string]any{"unknownCheck": map[string]any{}}, 0},
 	}
 	for _, tt := range tests {

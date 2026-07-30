@@ -22,6 +22,7 @@ Key properties:
   - `serviceReadyEndpoints` — Service endpoint addresses via EndpointSlices (`get` on `services`, `list` on `discovery.k8s.io/endpointslices`)
   - `podLabelReady` — Pod count by label selector (`list` on `pods`)
   - `argoApplicationHealthy` — Argo CD Application health/sync status (`get` on `argoproj.io/applications`)
+  - `fluxHelmReleaseReady` — Flux HelmRelease Ready condition, generation currency, and Stalled (`get` on `helm.toolkit.fluxcd.io/helmreleases`)
 - **Expected client**: An Argo CD PreSync hook Job (or similar) that polls until 200 OK.
 - **RBAC model**: Gatekeeper only needs `get` per named resource and `list` for collections. No `list`/`watch` needed for named lookups. Caller SAs need matching RBAC for the specific check types used in their Gate.
 

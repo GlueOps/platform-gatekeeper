@@ -29,3 +29,7 @@ spec:
     - id: monitoring
       argoApplicationHealthy:
         name: monitoring-stack
+    - id: cert-manager
+      namespace: glueops-core-flux
+      fluxHelmReleaseReady:
+        name: cert-manager

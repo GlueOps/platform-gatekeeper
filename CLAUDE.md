@@ -44,6 +44,9 @@ Configuration is via `.env` file (loaded by godotenv) or environment variables. 
 | `serviceReadyEndpoints` | Endpoint addresses via EndpointSlices | `get` services, `list` endpointslices |
 | `podLabelReady` | Pod count by label selector | `list` on pods |
 | `argoApplicationHealthy` | Argo CD Application health + sync status | `get` on `argoproj.io/applications` |
+| `fluxHelmReleaseReady` | Flux HelmRelease Ready condition, generation currency, and Stalled | `get` on `helm.toolkit.fluxcd.io/helmreleases` |
+
+`fluxHelmReleaseReady` reports `Stalled=True` distinctly from a plain not-Ready. They need different responses: not-Ready means keep polling, Stalled means helm-controller has given up and will not retry until the spec, values or chart version change. Do not collapse them.
 
 Gatekeeper fetches each resource individually by name — no `list` or `watch` needed except for pods and endpointslices which are collection queries. Caller SAs only need RBAC for the check types used in their Gate.
 

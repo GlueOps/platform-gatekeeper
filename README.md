@@ -201,6 +201,27 @@ Checks an Argo CD Application is Healthy and/or Synced.
     requireHealthy: true
 ```
 
+`fluxHelmReleaseReady`
+
+Checks a Flux `helm.toolkit.fluxcd.io/v2` HelmRelease is Ready, on the current
+generation, and not Stalled.
+```yaml
+- id: cert-manager
+  namespace: glueops-core-flux
+  fluxHelmReleaseReady:
+    name: cert-manager
+    requireCurrentGeneration: true
+```
+
+Prefer this over pointing `deploymentAvailable` at the workload a HelmRelease manages.
+A Deployment check reads whatever is in the cluster right now, so during a failed
+upgrade it reports ready against the *previous* revision's pods while the release
+behind them is broken.
+
+Note that Flux HelmReleases usually live in the namespace Flux reconciles from, not
+alongside the workload — hence the `namespace` override above, which requires the
+caller's namespace to be in `platform` mode.
+
 ## HTTP API
 ### GET /healthz
 
@@ -478,6 +499,8 @@ spec:
 ```
 
 `argoApplicationHealthy` checks the Argo CD Application CR’s `status.health.status` (must be `"Healthy"`) and `status.sync.status` (must be `"Synced"`). Both flags default to `true` and can be independently disabled if you only care about one dimension.
+
+`fluxHelmReleaseReady` is the equivalent for a Flux-managed component. It requires the `Ready` condition to be `True`, and by default requires `status.observedGeneration` to have caught up with `metadata.generation` — otherwise the Ready condition describes a revision the controller has already superseded. `Stalled=True` is reported as its own message rather than as a generic not-ready, because the two need different responses: not-ready means keep polling, Stalled means helm-controller exhausted `spec.upgrade.remediation.retries` and will not try again until the spec, values or chart version change. A poller that cannot tell them apart spends its whole timeout on a release that was never going to recover.
 
 ### Pattern 6: Mixed check types
 

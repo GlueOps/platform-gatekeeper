@@ -92,6 +92,21 @@ spec:
                           requireSynced: { type: boolean, default: true }
                           requireHealthy: { type: boolean, default: true }
 
+                      # Flux helm.toolkit.fluxcd.io/v2 HelmRelease. Prefer this over
+                      # pointing deploymentAvailable at the workload a HelmRelease
+                      # manages: during a failed upgrade the Deployment check reports
+                      # ready against the previous revision's pods while the release
+                      # behind them is broken.
+                      fluxHelmReleaseReady:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          # Require status.observedGeneration to have caught up with
+                          # metadata.generation. With this false the Ready condition is
+                          # trusted even when it describes an older revision.
+                          requireCurrentGeneration: { type: boolean, default: true }
+
             status:
               type: object
               properties:
