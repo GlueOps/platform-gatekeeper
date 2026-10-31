@@ -12,7 +12,7 @@ wave can hold a rollout until the dependencies are up.
 It is a **controller, not a service**. There is no request API: nothing calls
 gatekeeper to ask a question. It lists Gates on a timer, evaluates each check, and
 writes a `Ready` condition plus a per-check breakdown. The only HTTP endpoints are
-`/healthz` (a plain process check for the kubelet) and `/metrics` (one gauge).
+`/healthz` (a plain process check for the kubelet) and `/metrics` (three gauges).
 
 Gatekeeper reads dependencies with **its own** ServiceAccount. Callers have no
 credentials and need no RBAC.
@@ -138,7 +138,8 @@ information.
    paths. A heartbeat Lease plus a watchdog that marks Gates stale was designed and
    **rejected**: it bought about a minute of detection over ordinary Deployment
    alerting while becoming the only component able to block every rollout in the
-   cluster. The mitigation is one alert (`prometheusrule.yaml`).
+   cluster. The mitigation is alerting instead (`prometheusrule.yaml`), on sweep
+   freshness and on Gates stuck unevaluated.
    **The open edge case:** a gate protecting something irreversible, such as a
    migration an app must not start before, does not self-heal. Nothing in the tooling
    prevents writing one. If that comes up, add a synchronous check that fails closed
@@ -194,7 +195,15 @@ information.
     Service has one slice per family describing the *same* pods, and
     `Endpoints[].Addresses` holds alternate addresses for a *single* endpoint. Summing
     either would satisfy `minReadyAddresses` with fewer real backends than asked for.
-13. **Rejected: configurable Gate GVR.** `GATEKEEPER_GATE_{GROUP,VERSION,RESOURCE}`
+13. **Accepted: no per-Gate attribution in logs.** Removing per-caller
+    SubjectAccessReview means the API server audit log attributes every dependency
+    read to gatekeeper's ServiceAccount. An earlier version logged one line per Gate
+    per sweep to compensate, but it only logged check *ids* — which are static in
+    `spec.checks` and already published to `status.results` — at ~2,900 lines per
+    Gate per day. Logging is now transition-only. Per-Gate attribution comes from
+    the Gate's own spec and `status.results`; if a time-ordered record is ever
+    needed, that's a reason to add Events rather than to restore the log line.
+14. **Rejected: configurable Gate GVR.** `GATEKEEPER_GATE_{GROUP,VERSION,RESOURCE}`
     were removed. A different group or plural means a different CRD, hence a different
     `crd.yaml` and ClusterRole, so the knob served a scenario that can't occur.
 
@@ -202,3 +211,25 @@ information.
 
 Maintained by the GlueOps core platform team. Changes here affect whether production
 rollouts are correctly gated — review with multi-tenancy and failure modes in mind.
+
+## Argo CD interactions worth knowing
+
+Verified against upstream, and easy to get wrong:
+
+- **The Gate is kept out of the Application health rollup** by
+  `argocd.argoproj.io/ignore-healthcheck: "true"` in the shipped example. Argo CD's
+  app controller honours that annotation; the sync engine reads the Gate's health
+  directly and ignores it, so wave gating and terminal fail-fast still work. Without
+  the annotation, a Gate left blocked or terminal after a rollout keeps the whole
+  Application `Degraded` while its workloads are fine.
+- **`resource.exclusions` matching `gates` silently un-gates everything.** An
+  excluded Gate is stripped from the target objects, so it is never applied, never
+  produces a sync task, and the next wave runs immediately. The only signal is an
+  `ExcludedResourceWarning` condition.
+- **Wave gating is edge-triggered.** Once a wave is observed healthy Argo CD advances
+  and does not recheck, so a single Unknown→True→Unknown flap releases the next wave
+  for that sync.
+- **A Lua error yields health `Unknown`**, which the sync loop ignores — the wave
+  hangs with the Application showing Unknown rather than Degraded, and nothing
+  alerts. Test `examples/argocd-health-check.yaml` against a real Gate object before
+  shipping a change to it.

@@ -17,7 +17,9 @@ Three things decide whether this works:
 
 1. **`argocd-health-check.yaml` must be installed** (see below). Without it Argo CD
    has no health check for a `Gate`, treats it as having no health at all, and
-   proceeds immediately — the Gate exists but gates nothing.
+   proceeds immediately — the Gate exists but gates nothing. The same happens if
+   `gates` is matched by Argo CD's `resource.exclusions`, in which case the Gate is
+   never even applied.
 2. **The Gate goes in wave `-1`, not `0`.** The default wave *is* `0`, so a Gate at
    `0` shares a wave with every un-annotated resource and orders nothing.
 3. **The Gate must be in the same Application** as the workloads it gates. Sync

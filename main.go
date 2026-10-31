@@ -48,6 +48,7 @@ const (
 	reasonReady                = "Ready"
 
 	defaultReconcileInterval = 30 * time.Second
+	minReconcileInterval     = time.Second
 	// Gates are evaluated serially, so this bounds how far a sweep can be dragged
 	// out by unresponsive dependencies. Keep it well under the staleness alert's
 	// threshold divided by the expected Gate count.
@@ -167,10 +168,12 @@ func reconcileInterval() time.Duration {
 		log.Printf("warning: bad GATEKEEPER_RECONCILE_INTERVAL %q, using %s: %v", raw, defaultReconcileInterval, err)
 		return defaultReconcileInterval
 	}
-	// A zero or negative interval would spin the sweep loop without pause. To stop
-	// reconciling, scale the Deployment to zero.
-	if d <= 0 {
-		log.Printf("warning: GATEKEEPER_RECONCILE_INTERVAL %q is not positive, using %s", raw, defaultReconcileInterval)
+	// Below a second the loop would hammer the API server rather than reconcile;
+	// zero or negative would spin it with no pause at all. To stop reconciling,
+	// scale the Deployment to zero.
+	if d < minReconcileInterval {
+		log.Printf("warning: GATEKEEPER_RECONCILE_INTERVAL %q is below the %s floor, using %s",
+			raw, minReconcileInterval, defaultReconcileInterval)
 		return defaultReconcileInterval
 	}
 	return d

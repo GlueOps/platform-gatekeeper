@@ -3,23 +3,28 @@
 # NOT fire for the most likely outage — a pod that is still in service discovery
 # but cannot be scraped, where `up` is a present 0 and the gauge goes stale, so a
 # naive `absent(up{...})` plus a `time() - gauge` arm are both false. These tests
-# pin that behaviour.
+# pin that behaviour, and the thresholds.
 #
 # Run them (promtool wants bare rule groups, not the PrometheusRule wrapper):
 #
-#   mkdir -p .promcheck && cp prometheusrule_test.yaml .promcheck/test.yaml
+#   mkdir -p .pc && cp prometheusrule_test.yaml .pc/test.yaml
 #   docker run --rm -v "$PWD":/w -w /w python:3.12-alpine sh -c \
-#     'pip install -q pyyaml && python -c "import yaml;yaml.safe_dump(yaml.safe_load(open(\"prometheusrule.yaml\"))[\"spec\"],open(\".promcheck/rules.yaml\",\"w\"))"'
-#   docker run --rm -v "$PWD/.promcheck":/t -w /t --entrypoint promtool \
+#     'pip install -q pyyaml && python -c "import yaml;yaml.safe_dump(yaml.safe_load(open(\"prometheusrule.yaml\"))[\"spec\"],open(\".pc/rules.yaml\",\"w\"))"'
+#   docker run --rm -v "$PWD/.pc":/t -w /t --entrypoint promtool \
 #     prom/prometheus:v3.5.0 test rules test.yaml
+#   rm -rf .pc
 #
+# promtool compares the whole annotation set, so each description is spelled out
+# once as a YAML anchor at its first use and aliased afterwards. Keep them in step
+# with prometheusrule.yaml.
 rule_files:
   - rules.yaml
 evaluation_interval: 1m
+
 tests:
-  # The failure the previous expression missed entirely: the pod is still in
-  # service discovery but cannot be scraped, so up is a present 0 and the gauge
-  # goes stale. Both old arms were false and the alert never fired.
+  # The failure the obvious expression misses entirely: the pod is still in service
+  # discovery but cannot be scraped, so `up` is a present 0 and the gauge goes
+  # stale. Both the staleness arm and `absent()` are false here.
   - interval: 1m
     name: pod present but unscrapable
     input_series:
@@ -32,7 +37,7 @@ tests:
         alertname: GatekeeperNotReconciling
         exp_alerts:
           - exp_labels: { severity: warning }
-            exp_annotations:
+            exp_annotations: &stale_annotations
               summary: Gatekeeper is not publishing Gate readiness
               description: "Gate readiness is stale, so deployments gated on an already-Ready Gate may proceed without their dependencies being verified. Check the gatekeeper Deployment in glueops-core-gatekeeper, then confirm sweeps are completing with `kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper --tail=20 | grep sweep:` (note that `kubectl get gates` will NOT show this: LAST-TRANSITION is deliberately inherited, so a Gate that has been Ready for days looks identical whether it was evaluated seconds or hours ago). Once recovered, review which gated Applications synced during the window. An Argo CD sync stuck waiting on a gate is released with `argocd app terminate-op <app>`."
 
@@ -46,16 +51,60 @@ tests:
         alertname: GatekeeperNotReconciling
         exp_alerts:
           - exp_labels: { severity: warning }
-            exp_annotations:
-              summary: Gatekeeper is not publishing Gate readiness
-              description: "Gate readiness is stale, so deployments gated on an already-Ready Gate may proceed without their dependencies being verified. Check the gatekeeper Deployment in glueops-core-gatekeeper, then confirm sweeps are completing with `kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper --tail=20 | grep sweep:` (note that `kubectl get gates` will NOT show this: LAST-TRANSITION is deliberately inherited, so a Gate that has been Ready for days looks identical whether it was evaluated seconds or hours ago). Once recovered, review which gated Applications synced during the window. An Argo CD sync stuck waiting on a gate is released with `argocd app terminate-op <app>`."
+            exp_annotations: *stale_annotations
+
+  # The staleness arm on its own: scrapable pod, frozen sweep timestamp. Pins the
+  # 300s threshold plus `for: 2m` — the other cases fire via the up/absent arms, so
+  # without this a threshold edit would go unnoticed.
+  - interval: 1m
+    name: live pod with a wedged sweep
+    input_series:
+      - series: 'up{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
+        values: '1+0x20'
+      - series: 'gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
+        values: '0+0x20'
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: GatekeeperNotReconciling
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: GatekeeperNotReconciling
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: *stale_annotations
+
+  # A live gatekeeper that reaches no verdict: sweeps succeed, so the staleness
+  # alert stays quiet, but no Gate carries a usable answer. Pins `for: 15m`.
+  - interval: 1m
+    name: gates stuck unevaluated
+    input_series:
+      - series: 'up{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
+        values: '1+0x20'
+      - series: 'gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
+        values: '0+60x20'
+      - series: 'gatekeeper_gates_unevaluated{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
+        values: '1+0x20'
+    alert_rule_test:
+      - eval_time: 14m
+        alertname: GatekeeperGatesUnevaluated
+        exp_alerts: []
+      - eval_time: 16m
+        alertname: GatekeeperGatesUnevaluated
+        exp_alerts:
+          - exp_labels: { severity: warning }
+            exp_annotations: &unevaluated_annotations
+              summary: Gatekeeper cannot evaluate some Gates
+              description: "One or more Gates have been stuck with Ready=Unknown. Gated rollouts are waiting rather than proceeding, so this blocks deploys rather than risking them. Find the affected Gates with `kubectl get gates -A | grep Unknown` and read `.status.results` for the reason; common causes are gatekeeper's ClusterRole missing a kind and the Kubernetes API rejecting its reads."
+      # The staleness alert must stay quiet throughout: the sweeps are fine.
+      - eval_time: 16m
+        alertname: GatekeeperNotReconciling
+        exp_alerts: []
 
   - interval: 1m
     name: healthy gatekeeper stays quiet
     input_series:
       - series: 'up{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
         values: '1+0x40'
-      # Sweep timestamp advancing with wall clock; starts near the test epoch.
       - series: 'gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'
         values: '0+60x40'
       - series: 'gatekeeper_gates_unevaluated{job="glueops-core-gatekeeper",instance="10.0.0.1:8080"}'

@@ -1578,3 +1578,29 @@ func TestHandleMetricsExposesTheAlertedSeries(t *testing.T) {
 		}
 	}
 }
+
+func TestReconcileIntervalFloor(t *testing.T) {
+	tests := []struct {
+		raw  string
+		want time.Duration
+	}{
+		{"", defaultReconcileInterval},
+		{"garbage", defaultReconcileInterval},
+		{"0", defaultReconcileInterval},
+		{"-5s", defaultReconcileInterval},
+		// Sub-second values would hammer the API server rather than reconcile.
+		{"1ns", defaultReconcileInterval},
+		{"500ms", defaultReconcileInterval},
+		{"1s", time.Second},
+		{"45s", 45 * time.Second},
+		{"5m", 5 * time.Minute},
+	}
+	for _, tt := range tests {
+		t.Run(tt.raw, func(t *testing.T) {
+			t.Setenv("GATEKEEPER_RECONCILE_INTERVAL", tt.raw)
+			if got := reconcileInterval(); got != tt.want {
+				t.Errorf("reconcileInterval() with %q = %s, want %s", tt.raw, got, tt.want)
+			}
+		})
+	}
+}

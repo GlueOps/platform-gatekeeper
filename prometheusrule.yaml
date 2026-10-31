@@ -57,7 +57,7 @@ spec:
         # sweep from a wedged one.
         - alert: GatekeeperNotReconciling
           expr: >-
-            max(time() - gatekeeper_last_successful_sweep_timestamp_seconds) > 300
+            max(time() - gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper"}) > 300
             or max(up{job="glueops-core-gatekeeper"}) == 0
             or max(absent(up{job="glueops-core-gatekeeper"})) > 0
           for: 2m
@@ -84,7 +84,7 @@ spec:
         # tuned independently -- a single Gate going Unknown for one sweep is a
         # normal transient, which is why this is patient.
         - alert: GatekeeperGatesUnevaluated
-          expr: max(gatekeeper_gates_unevaluated) > 0
+          expr: max(gatekeeper_gates_unevaluated{job="glueops-core-gatekeeper"}) > 0
           for: 15m
           labels:
             severity: warning

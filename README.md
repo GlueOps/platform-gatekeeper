@@ -125,6 +125,12 @@ chart).
 `Gate`, and a resource with no health check is *skipped* in the Application health
 rollup — the wave completes immediately and the next wave proceeds ungated.
 
+**Also check `gates` isn't matched by `resource.exclusions`.** An excluded Gate is
+stripped from the target objects before the sync, so it is never applied, never
+produces a sync task, and wave 0 runs immediately — the same silent un-gating as a
+missing health check. The only signal is an `ExcludedResourceWarning` condition on
+the Application.
+
 ### 4. Set an Argo CD sync timeout — required
 
 Set `--sync-timeout` (or `ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT`) on the
@@ -210,6 +216,16 @@ $ kubectl get gate my-app-dependencies -n nonprod -o jsonpath='{.status.results}
 `Terminal` surfaces in Argo CD as `Degraded`, which fails the sync operation promptly
 instead of waiting out the timeout. Everything else that isn't ready reads as
 `Progressing`.
+
+One consequence worth knowing: because Argo CD folds resource health into the
+Application's on a worst-wins basis, a Gate left blocked or terminal *after* a
+rollout keeps the Application `Degraded` even when every workload is healthy — so
+health notifications and `argocd app wait` fire on the dependency rather than on
+your app, and later syncs fail at wave `-1`, including an unrelated image bump.
+Annotating the Gate `argocd.argoproj.io/ignore-healthcheck: "true"` removes it from
+that rollup while leaving wave gating and terminal fail-fast fully intact, because
+the sync engine reads the Gate's health directly rather than through the rollup.
+The shipped example sets it.
 
 Note that `LAST-TRANSITION` is the last time the condition *changed*, not the last
 time it was evaluated — so it cannot tell you whether gatekeeper is still running.
@@ -367,7 +383,7 @@ therefore a privileged grant.
 
 | Env var | Default | Description |
 | --- | --- | --- |
-| `GATEKEEPER_RECONCILE_INTERVAL` | `30s` | How often to re-evaluate every Gate. A non-positive value falls back to the default; to stop reconciling, scale the Deployment to 0. |
+| `GATEKEEPER_RECONCILE_INTERVAL` | `30s` | How often to re-evaluate every Gate. Minimum 1s; anything lower or unparseable falls back to the default. To stop reconciling, scale the Deployment to 0. |
 | `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES` | *(empty)* | CSV of namespaces platform-mode Gates may read from |
 | `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES` | *(empty)* | CSV of namespace prefixes, e.g. `glueops-core-` |
 | `PORT` | `8080` | HTTP port for `/healthz` and `/metrics` |
@@ -415,10 +431,31 @@ kubectl apply -f crd.yaml
 
 **Otherwise, migrate the stored version without deleting anything:**
 
-1. Apply a CRD listing *both* versions with `v1alpha2` as the storage version.
+1. Apply a CRD listing *both* versions with `v1alpha2` as the storage version. The
+   repo doesn't ship a `v1alpha1` schema, but it doesn't need to be a real one — a
+   stub is enough to satisfy the check:
+
+   ```yaml
+   - name: v1alpha1
+     served: false
+     storage: false
+     schema:
+       openAPIV3Schema:
+         type: object
+         x-kubernetes-preserve-unknown-fields: true
+   ```
+
 2. Rewrite every Gate so it re-persists at the new version:
    `kubectl get gates -A -o json | kubectl replace -f -`
-3. Patch the CRD's `status.storedVersions` to `["v1alpha2"]`.
+3. Drop the old version from the CRD's `status.storedVersions`. **The
+   `--subresource=status` flag is required** — without it the `status` key is
+   silently discarded and step 4 fails with the same error:
+
+   ```bash
+   kubectl patch crd gates.platform.glueops.dev --subresource=status \
+     --type merge -p '{"status":{"storedVersions":["v1alpha2"]}}'
+   ```
+
 4. Now apply the `v1alpha2`-only `crd.yaml`.
 
 Either way, merge the tenant-side Git changes (dropping `spec.strict`, adding the
