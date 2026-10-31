@@ -20,14 +20,16 @@ kind: ClusterRole
 metadata:
   name: glueops-core-gatekeeper
 rules:
-  # The reconcile loop lists every Gate each sweep and writes its status.
+  # The reconcile loop lists every Gate each sweep and merge-patches its status.
+  # Deliberately no `get` (nothing reads a single Gate) and no `update` (status is
+  # only ever merge-patched).
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates"]
-    verbs: ["get", "list"]
+    verbs: ["list"]
 
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates/status"]
-    verbs: ["patch", "update"]
+    verbs: ["patch"]
 
   # Resolves the customer/platform mode label on a Gate's namespace.
   - apiGroups: [""]

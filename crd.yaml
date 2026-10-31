@@ -45,10 +45,16 @@ spec:
                   items:
                     type: object
                     required: ["id"]
-                    # Structural pruning drops an unknown field before validation,
-                    # so a misspelled check type (deploymentAvailible) would leave a
-                    # check with only an id and silently verify nothing. This is the
-                    # only place that can catch it.
+                    # Structural pruning drops an unknown field before validation, so
+                    # a misspelled check type (deploymentAvailible) would leave a
+                    # check with only an id and silently verify nothing. kubectl
+                    # catches that itself (it defaults to strict field validation and
+                    # names the unknown field), so this rule exists for the clients
+                    # that don't -- notably Argo CD.
+                    #
+                    # It does not help with a misspelled field *inside* a check block:
+                    # `minAvailableReplcias: 5` is pruned and silently defaulted to 1,
+                    # and only strict field validation catches that.
                     x-kubernetes-validations:
                       - rule: >-
                           [has(self.deploymentAvailable), has(self.statefulSetReady),
@@ -141,13 +147,19 @@ spec:
                   x-kubernetes-list-map-keys: ["type"]
                   items:
                     type: object
-                    required: ["type", "status", "reason", "lastTransitionTime"]
+                    # Mirrors metav1.Condition, so generated typed clients see the
+                    # shape they expect.
+                    required: ["type", "status", "reason", "message", "lastTransitionTime"]
                     properties:
                       type: { type: string, minLength: 1, maxLength: 316 }
                       status:
                         type: string
                         enum: ["True", "False", "Unknown"]
-                      reason: { type: string, minLength: 1, maxLength: 1024 }
+                      reason:
+                        type: string
+                        minLength: 1
+                        maxLength: 1024
+                        pattern: '^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$'
                       message: { type: string, maxLength: 32768 }
                       lastTransitionTime: { type: string, format: date-time }
                       observedGeneration: { type: integer, minimum: 0 }

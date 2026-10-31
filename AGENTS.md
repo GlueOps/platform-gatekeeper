@@ -26,7 +26,9 @@ credentials and need no RBAC.
 | `crd.yaml` | the `Gate` CRD, including the CEL rule enforcing exactly one check type |
 | `rbac.yaml` | ServiceAccount, ClusterRole, binding — **the ceiling on what any Gate can read** |
 | `deploy.yaml` | Deployment and Service |
-| `prometheusrule.yaml` | the single staleness alert (optional; needs the Prometheus Operator) |
+| `servicemonitor.yaml` | scrape config, shipped so the alerts' `job` label is a contract |
+| `prometheusrule.yaml` | the staleness alerts (optional; needs the Prometheus Operator) |
+| `prometheusrule_test.yaml` | promtool unit tests for those alerts — see the header for how to run them |
 | `examples/wave-gating/` | the worked example a consumer copies |
 | `examples/argocd-health-check.yaml` | the Lua health check for `argocd-cm` — **required**, see Decisions |
 
@@ -47,7 +49,15 @@ End-to-end against a throwaway cluster:
 k3d cluster create gatekeeper-test
 docker build -t platform-gatekeeper:dev . && k3d image import platform-gatekeeper:dev -c gatekeeper-test
 kubectl apply -f crd.yaml -f rbac.yaml -f deploy.yaml
+kubectl set image deployment/glueops-core-gatekeeper gatekeeper=platform-gatekeeper:dev -n glueops-core-gatekeeper
 ```
+
+That gives you a working controller but **not** working gating: Argo CD also needs
+the Lua health check and `--sync-timeout` (Decisions 4 and 5), without which a Gate
+silently gates nothing. See README's Install section.
+
+Note `kubectl apply -f crd.yaml` fails on a cluster that already has `v1alpha1`
+installed — see README's Upgrading section.
 
 ## How evaluation is structured
 
@@ -68,17 +78,30 @@ kubectl apply -f crd.yaml -f rbac.yaml -f deploy.yaml
 1. Add the schema block to `crd.yaml` **and** the key to the CEL rule's list.
 2. Add the key to `countCheckTypes()` in `main.go`.
 3. Add a branch to `evalOne()` and a pure predicate function.
-4. Add the kind to `rbac.yaml`, and to the table in `README.md`.
-5. Table-test the predicate in `main_test.go`.
+4. Add the kind to `rbac.yaml`, the table in `README.md`, and
+   `examples/gates/all-check-types-gate.yaml` (which `examples/README.md` advertises
+   as showing every type).
+5. Table-test the predicate in `main_test.go`, **and add a row to
+   `TestEveryCheckTypeDispatches`** covering each option name. A predicate test
+   alone is not enough: the option names and GVRs in `evalOne` are string literals
+   hand-matched against `crd.yaml`, and a typo there fails silently — the key lookup
+   misses, `numOr`/`boolOr` return the default, and the predicate test still passes
+   because it takes the value as an argument.
 
-If the dependency can enter a state it will never leave without human action, the
-predicate must report `terminal` — see Decisions.
+Only report `terminal` if the dependency's own controller has declared it stopped
+trying — see Decision 6.
 
 ## Rules
 
 - **Never return resource contents.** Status carries readiness booleans and
-  human-safe messages only. Don't echo arbitrary upstream fields into a Gate's
-  status; a Gate is readable by anyone who can read its namespace.
+  human-safe messages only. A Gate is readable by anyone who can read its namespace,
+  and the Argo CD health check republishes its condition message into the UI, where
+  visibility is governed by AppProject RBAC — usually a much wider audience.
+  Concretely: echo only strings the resource's *own controller* draws from a bounded
+  vocabulary — a condition `reason`, an enum like Argo CD's `health.status`. Never
+  echo a condition `message`: Flux's wraps a Helm error, which wraps whatever
+  rejected the release, and admission webhooks routinely quote the offending
+  object's field values. Use the `withReason` helper.
 - **Never grant `secrets` or `configmaps`** in `rbac.yaml`. That ClusterRole is the
   only thing bounding what a Gate can observe.
 - **Enforce the namespace policy before reading.** `customer` mode is
@@ -90,9 +113,12 @@ predicate must report `terminal` — see Decisions.
 - **Preserve `lastTransitionTime` unless the status actually changes.** It means "when
   this last changed", and restamping it every sweep turns reconciliation into
   continuous writes that wake every Argo CD watcher.
-- **Keep `Server` immutable after `main()`.** The reconcile loop owns all state; the
-  only shared field is `lastSweep` (an atomic). Don't add mutable fields — put
-  per-sweep state in locals.
+- **Keep `Server` immutable after `main()`** apart from the three published metrics
+  (`lastSweep`, `gatesUnknown`, `sweepDuration`), which are atomics written by the
+  sweep and read by `/metrics`. Per-sweep state goes in locals, not fields.
+- **The metric names are a contract with `prometheusrule.yaml`.** Renaming either
+  side silently disables the alerts; `TestHandleMetricsExposesTheAlertedSeries`
+  guards it.
 - Use client-go; never shell out.
 
 ## Decisions
@@ -128,11 +154,19 @@ information.
 5. **`--sync-timeout` must be set cluster-wide.** It defaults to never, and a Running
    sync operation blocks later auto-syncs of that Application including the fix. This
    is also what turns a hung wave into a visible failure.
-6. **Terminal is distinct from not-ready, and derived in Go.** A failed Job, a
-   Degraded Application and a stalled HelmRelease will not recover on their own, so
-   they surface as `reason: Terminal` → Argo CD `Degraded` → prompt sync failure. A
+6. **Terminal means the upstream controller has declared it stopped trying** — not
+   "this looks unhealthy right now". Only a Job's `Failed=True` and a Flux
+   HelmRelease's `Stalled=True` qualify; they surface as `reason: Terminal` → Argo CD
+   `Degraded` → prompt sync failure instead of waiting out `--sync-timeout`. A
    declarative `terminalWhen` field was rejected: it pushes per-technology trivia into
    tenant YAML and can't express the Job case at all.
+   **Argo CD health values are deliberately never terminal.** Health is a rollup over
+   an Application's resources: `Degraded` and `Progressing` both occur mid-rollout,
+   and `Missing` is the normal state of an Application whose resources aren't live
+   yet — which is exactly what a Gate guarding a not-yet-bootstrapped platform stack
+   should wait for. An earlier version treated `Degraded` and `Missing` as terminal
+   and inverted `examples/gates/observability-stack-gate.yaml` on a cold bootstrap:
+   the Gate failed the rollout it was supposed to hold.
 7. **`spec.strict` was removed.** It claimed non-strict Gates could pass with skipped
    checks, which the code never did. Every check is always evaluated and reported, and
    a check that cannot be evaluated always blocks the Gate.
@@ -147,6 +181,22 @@ information.
 10. **This model assumes tenants cannot `patch` namespaces.** The `customer`/`platform`
     mode label is the policy boundary, so a tenant able to relabel their own namespace
     could promote themselves to platform mode.
+11. **A Gate must express steady state, not an event.** It is a managed resource in
+    wave `-1` of *every* sync, re-evaluated each time — not a one-shot precondition.
+    So the gated condition has to stay true for the life of the Application. Gating
+    on a migration `jobComplete` is the trap: it works until `ttlSecondsAfterFinished`
+    or a `HookSucceeded` hook removes the Job, after which every later sync of that
+    Application hangs at wave `-1` with auto-sync skipped, including the fix-forward
+    commit. `jobComplete` is still shipped, with the caveat documented at its check
+    type and in `examples/wave-gating/gate.yaml`.
+12. **Readiness counts backends, not addresses.** `serviceReadyEndpoints` takes the
+    maximum across address families rather than summing EndpointSlices: a dual-stack
+    Service has one slice per family describing the *same* pods, and
+    `Endpoints[].Addresses` holds alternate addresses for a *single* endpoint. Summing
+    either would satisfy `minReadyAddresses` with fewer real backends than asked for.
+13. **Rejected: configurable Gate GVR.** `GATEKEEPER_GATE_{GROUP,VERSION,RESOURCE}`
+    were removed. A different group or plural means a different CRD, hence a different
+    `crd.yaml` and ClusterRole, so the knob served a scenario that can't occur.
 
 ## Ownership
 

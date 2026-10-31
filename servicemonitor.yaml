@@ -1,0 +1,23 @@
+# Optional, and needs the Prometheus Operator. Shipped so the `job` label the
+# alerts in prometheusrule.yaml key on is a contract rather than a guess: the
+# operator defaults `job` to the Service name, which is what those alerts expect.
+#
+# metadata.labels must satisfy your Prometheus's `serviceMonitorSelector` —
+# kube-prometheus-stack defaults it to `{release: <releaseName>}`, the same trap as
+# the PrometheusRule's ruleSelector.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+    # release: kube-prometheus-stack   # uncomment to match a default selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glueops-core-gatekeeper
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

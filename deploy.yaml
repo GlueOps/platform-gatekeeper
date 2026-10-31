@@ -7,11 +7,16 @@ metadata:
     app.kubernetes.io/name: glueops-core-gatekeeper
 spec:
   replicas: 1
-  # Recreate rather than RollingUpdate: two reconcilers writing the same Gate
-  # statuses during a rollout is wasteful, and there is nothing to keep available
-  # since no request path depends on this pod.
+  # RollingUpdate with maxUnavailable: 0 keeps the old pod reconciling until the new
+  # one is Ready. That matters more than avoiding overlap: a bad image under
+  # Recreate leaves *zero* reconcilers and every Gate goes stale, whereas a few
+  # seconds of two pods writing the same statuses is harmless — the writes are
+  # idempotent merge patches.
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   selector:
     matchLabels:
       app.kubernetes.io/name: glueops-core-gatekeeper
@@ -21,14 +26,28 @@ spec:
         app.kubernetes.io/name: glueops-core-gatekeeper
     spec:
       serviceAccountName: glueops-core-gatekeeper
+      # Gatekeeper being evicted is the silent-staleness failure, and at priority 0
+      # a Burstable single-replica pod loses scheduling races during a drain.
+      priorityClassName: system-cluster-critical
       securityContext:
         runAsNonRoot: true
+        # Matches the numeric USER in the distroless:nonroot base image the
+        # Dockerfile pins. Stated explicitly so a base-image bump surfaces as a
+        # manifest change rather than a kubelet CreateContainerConfigError.
+        runAsUser: 65532
+        runAsGroup: 65532
         seccompProfile:
           type: RuntimeDefault
       containers:
         - name: gatekeeper
+          # Replace this with a released tag pinned by digest before running it
+          # anywhere that matters, the way the Dockerfile pins its own base images.
+          # Do NOT combine a floating tag with imagePullPolicy: IfNotPresent: a node
+          # that already cached the tag never pulls the new build, versions diverge
+          # per node, and because the pod template is then byte-identical between
+          # releases `kubectl apply` is a no-op, so no rollout happens at all. The
+          # policy is left unset here so it defaults to Always for a floating tag.
           image: ghcr.io/glueops/platform-gatekeeper:latest
-          imagePullPolicy: IfNotPresent
           ports:
             - name: http
               containerPort: 8080
@@ -41,6 +60,10 @@ spec:
               value: "glueops-core-"
             - name: GATEKEEPER_RECONCILE_INTERVAL
               value: "30s"
+            # Keep below the memory limit so growth costs GC cycles instead of an
+            # OOMKill, which for a single-replica controller means stale Gates.
+            - name: GOMEMLIMIT
+              value: "200MiB"
           # A plain process check on purpose. Tying liveness to sweep success would
           # turn an apiserver outage into CrashLoopBackOff, and a restarting pod
           # reconciles less than a wedged one. Staleness is an alert (see

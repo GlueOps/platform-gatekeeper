@@ -48,9 +48,20 @@ const (
 	reasonReady                = "Ready"
 
 	defaultReconcileInterval = 30 * time.Second
-	perGateTimeout           = 20 * time.Second
-	maxMessageLen            = 1024
+	// Gates are evaluated serially, so this bounds how far a sweep can be dragged
+	// out by unresponsive dependencies. Keep it well under the staleness alert's
+	// threshold divided by the expected Gate count.
+	perGateTimeout = 10 * time.Second
+	maxMessageLen  = 1024
 )
+
+// The Gate CRD's identity. Not configurable: a different group or plural means a
+// different CRD, which means a different crd.yaml and ClusterRole.
+var gateGVR = schema.GroupVersionResource{
+	Group:    "platform.glueops.dev",
+	Version:  "v1alpha2",
+	Resource: "gates",
+}
 
 type Server struct {
 	kube kubernetes.Interface
@@ -60,14 +71,16 @@ type Server struct {
 	gateGVR schema.GroupVersionResource
 
 	// platform-mode cross-namespace allowlist
-	platformAllowedNS       map[string]bool
+	platformAllowedNS       []string
 	platformAllowedPrefixes []string
 
 	reconcileInterval time.Duration
 
-	// lastSweep holds the unix time of the last fully successful sweep. It is the
-	// only mutable field: written by the reconcile loop, read by /metrics.
-	lastSweep atomic.Int64
+	// Written by the reconcile loop, read by /metrics. These are the only mutable
+	// fields; everything else is fixed after main().
+	lastSweep     atomic.Int64 // unix time of the last sweep that wrote every Gate
+	gatesUnknown  atomic.Int64 // Gates whose last condition was Unknown
+	sweepDuration atomic.Int64 // milliseconds the last sweep took
 }
 
 type EvalResult struct {
@@ -96,28 +109,20 @@ func main() {
 	}
 
 	s := &Server{
-		kube: kube,
-		dyn:  dyn,
-		gateGVR: schema.GroupVersionResource{
-			Group:    envOr("GATEKEEPER_GATE_GROUP", "platform.glueops.dev"),
-			Version:  envOr("GATEKEEPER_GATE_VERSION", "v1alpha2"),
-			Resource: envOr("GATEKEEPER_GATE_RESOURCE", "gates"),
-		},
+		kube:    kube,
+		dyn:     dyn,
+		gateGVR: gateGVR,
 		// Empty by default: an operator that forgets these env vars gets no
 		// cross-namespace access rather than a silently working allowlist.
-		platformAllowedNS:       parseCSVSet(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES")),
-		platformAllowedPrefixes: parseCSVList(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES")),
+		platformAllowedNS:       parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES")),
+		platformAllowedPrefixes: parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES")),
 		reconcileInterval:       reconcileInterval(),
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	if s.reconcileInterval > 0 {
-		go s.reconcileLoop(ctx)
-	} else {
-		log.Printf("reconcile loop disabled (GATEKEEPER_RECONCILE_INTERVAL=0)")
-	}
+	go s.reconcileLoop(ctx)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
@@ -162,6 +167,12 @@ func reconcileInterval() time.Duration {
 		log.Printf("warning: bad GATEKEEPER_RECONCILE_INTERVAL %q, using %s: %v", raw, defaultReconcileInterval, err)
 		return defaultReconcileInterval
 	}
+	// A zero or negative interval would spin the sweep loop without pause. To stop
+	// reconciling, scale the Deployment to zero.
+	if d <= 0 {
+		log.Printf("warning: GATEKEEPER_RECONCILE_INTERVAL %q is not positive, using %s", raw, defaultReconcileInterval)
+		return defaultReconcileInterval
+	}
 	return d
 }
 
@@ -169,9 +180,24 @@ func reconcileInterval() time.Duration {
 
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-	fmt.Fprint(w, "# HELP gatekeeper_last_successful_sweep_timestamp_seconds Unix time of the last sweep in which every Gate was evaluated and its status written.\n")
+
+	fmt.Fprint(w, "# HELP gatekeeper_last_successful_sweep_timestamp_seconds Unix time of the last sweep that listed the Gates and wrote a status to every one of them.\n")
 	fmt.Fprint(w, "# TYPE gatekeeper_last_successful_sweep_timestamp_seconds gauge\n")
 	fmt.Fprintf(w, "gatekeeper_last_successful_sweep_timestamp_seconds %d\n", s.lastSweep.Load())
+
+	// A live gatekeeper writing Unknown to everything is a distinct failure from a
+	// dead one: the sweeps succeed, but no Gate carries a usable answer and every
+	// gated rollout waits. Kept separate so it can be alerted on with its own
+	// threshold rather than collapsed into sweep liveness.
+	fmt.Fprint(w, "# HELP gatekeeper_gates_unevaluated Gates whose last evaluation could not reach a verdict.\n")
+	fmt.Fprint(w, "# TYPE gatekeeper_gates_unevaluated gauge\n")
+	fmt.Fprintf(w, "gatekeeper_gates_unevaluated %d\n", s.gatesUnknown.Load())
+
+	// Gates are evaluated serially, so this is what distinguishes "wedged" from
+	// "slow" when the staleness alert fires.
+	fmt.Fprint(w, "# HELP gatekeeper_sweep_duration_seconds Wall time of the last completed sweep.\n")
+	fmt.Fprint(w, "# TYPE gatekeeper_sweep_duration_seconds gauge\n")
+	fmt.Fprintf(w, "gatekeeper_sweep_duration_seconds %.3f\n", float64(s.sweepDuration.Load())/1000)
 }
 
 // --- reconcile
@@ -194,9 +220,11 @@ func (s *Server) reconcileLoop(ctx context.Context) {
 	}
 }
 
-// reconcileOnce evaluates every Gate in the cluster and records the sweep time if
-// all of them were written successfully.
+// reconcileOnce evaluates every Gate in the cluster and publishes the signals
+// /metrics exposes.
 func (s *Server) reconcileOnce(ctx context.Context) {
+	started := time.Now()
+
 	list, err := s.dyn.Resource(s.gateGVR).Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("sweep: list gates: %v", err)
@@ -205,31 +233,46 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 
 	// Many Gates share a namespace, so resolve each namespace's mode once per sweep.
 	modes := map[string]string{}
-	failed := 0
+	var wrote, failed, unknown int
 
 	for i := range list.Items {
 		gate := &list.Items[i]
-		if err := s.reconcileGate(ctx, gate, modes); err != nil {
-			// A Gate deleted mid-sweep is not a failure.
-			if apierrors.IsNotFound(err) {
-				continue
+		status, err := s.reconcileGate(ctx, gate, modes)
+		if err != nil {
+			// A Gate deleted mid-sweep is not a failure. This can't be used to
+			// infer that the sweep worked, though: a CRD installed without its
+			// status subresource 404s every patch, which would otherwise look
+			// like a cluster where every Gate was deleted at once. The wrote > 0
+			// requirement below is what catches that.
+			if !apierrors.IsNotFound(err) {
+				failed++
+				log.Printf("sweep: gate %s/%s: %v", gate.GetNamespace(), gate.GetName(), err)
 			}
-			failed++
-			log.Printf("sweep: gate %s/%s: %v", gate.GetNamespace(), gate.GetName(), err)
+			continue
+		}
+		wrote++
+		if status == metav1.ConditionUnknown {
+			unknown++
 		}
 	}
 
-	if failed == 0 {
+	s.gatesUnknown.Store(int64(unknown))
+	s.sweepDuration.Store(time.Since(started).Milliseconds())
+
+	if failed == 0 && (wrote > 0 || len(list.Items) == 0) {
 		s.lastSweep.Store(time.Now().Unix())
 	}
-	log.Printf("sweep: %d gates, %d write failures", len(list.Items), failed)
+	log.Printf("sweep: %d gates, %d written, %d unevaluated, %d failed, %s",
+		len(list.Items), wrote, unknown, failed, time.Since(started).Round(time.Millisecond))
 }
 
-func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructured, modes map[string]string) (err error) {
+// reconcileGate evaluates one Gate and writes its status, returning the condition
+// status it published.
+func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructured, modes map[string]string) (status metav1.ConditionStatus, err error) {
 	// One bad Gate must not take down the sweep.
 	defer func() {
 		if r := recover(); r != nil {
-			err = fmt.Errorf("panic evaluating gate: %v", r)
+			status, err = metav1.ConditionUnknown, fmt.Errorf("panic evaluating gate: %v", r)
 		}
 	}()
 
@@ -243,8 +286,8 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 		if modeErr != nil {
 			// Policy is undecidable, so make no claim about readiness rather than
 			// defaulting to a mode and evaluating under the wrong rules.
-			return s.writeStatus(ctx, gate, metav1.ConditionUnknown, reasonEvaluationFailed,
-				fmt.Sprintf("namespace mode lookup failed: %v", modeErr), nil)
+			return metav1.ConditionUnknown, s.writeStatus(ctx, gate, metav1.ConditionUnknown,
+				reasonEvaluationFailed, fmt.Sprintf("namespace mode lookup failed: %v", modeErr), nil)
 		}
 		mode = resolved
 		modes[ns] = mode
@@ -252,17 +295,9 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 
 	results := s.evaluateGate(ctx, mode, ns, gate)
 
-	// Dropping per-caller SubjectAccessReview means the API server audit log
-	// attributes every read to gatekeeper's ServiceAccount; this is the only
-	// remaining record of which Gate caused which reads.
-	ids := make([]string, 0, len(results))
-	for _, r := range results {
-		ids = append(ids, r.ID)
-	}
-	log.Printf("evaluated gate %s/%s (mode=%s) checks=%s", ns, gate.GetName(), mode, strings.Join(ids, ","))
-
-	status, reason, message := summarize(results)
-	return s.writeStatus(ctx, gate, status, reason, message, results)
+	var reason, message string
+	status, reason, message = summarize(results)
+	return status, s.writeStatus(ctx, gate, status, reason, message, results)
 }
 
 func (s *Server) namespaceMode(ctx context.Context, ns string) (string, error) {
@@ -277,8 +312,10 @@ func (s *Server) namespaceMode(ctx context.Context, ns string) (string, error) {
 }
 
 func (s *Server) platformNSAllowed(ns string) bool {
-	if s.platformAllowedNS[ns] {
-		return true
+	for _, allowed := range s.platformAllowedNS {
+		if ns == allowed {
+			return true
+		}
 	}
 	for _, p := range s.platformAllowedPrefixes {
 		if strings.HasPrefix(ns, p) {
@@ -374,7 +411,7 @@ func summarize(results []EvalResult) (metav1.ConditionStatus, string, string) {
 		reasonDependenciesNotReady,
 	} {
 		for _, r := range results {
-			if resultReason(r) != reason {
+			if r.Ready || r.Reason != reason {
 				continue
 			}
 			// "Could not evaluate" is not a claim that the dependency is unready.
@@ -386,17 +423,17 @@ func summarize(results []EvalResult) (metav1.ConditionStatus, string, string) {
 		}
 	}
 
-	return metav1.ConditionTrue, reasonReady, fmt.Sprintf("%d checks passed", len(results))
-}
+	// A not-ready result whose reason isn't in the table above would otherwise fall
+	// through to Ready, turning an unrecognised failure into a passing gate. Fail
+	// closed instead.
+	for _, r := range results {
+		if !r.Ready {
+			return metav1.ConditionFalse, reasonDependenciesNotReady,
+				truncate(fmt.Sprintf("%s: %s", r.ID, r.Message))
+		}
+	}
 
-func resultReason(r EvalResult) string {
-	if r.Ready {
-		return reasonReady
-	}
-	if r.Reason != "" {
-		return r.Reason
-	}
-	return reasonDependenciesNotReady
+	return metav1.ConditionTrue, reasonReady, fmt.Sprintf("%d checks passed", len(results))
 }
 
 func countCheckTypes(m map[string]any) int {
@@ -641,18 +678,21 @@ func jobComplete(j *batchv1.Job) (ready bool, msg string, terminal bool) {
 			return true, "job Complete=True", false
 		}
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
-			if c.Message != "" {
-				return false, "job Failed=True: " + c.Message, true
-			}
-			return false, "job Failed=True", true
+			return false, withReason("job Failed=True", c.Reason), true
 		}
 	}
 	return false, "job not complete yet", false
 }
 
-// argoAppReady evaluates an Argo CD Application's health and sync status. A
-// Degraded Application is terminal for the same reason a failed Job is: it will
-// not recover without a change, so waiting out the timeout achieves nothing.
+// argoAppReady evaluates an Argo CD Application's health and sync status.
+//
+// Nothing here is terminal. Argo CD's health is a rollup computed from an
+// Application's resources, not a statement that its controller has stopped trying:
+// Progressing and Degraded both occur mid-rollout, and Missing is simply the state
+// of an Application whose resources are not live yet, which is exactly what a Gate
+// guarding a not-yet-bootstrapped platform stack should wait for. Reporting any of
+// them as terminal would fail the gated sync — and because a Gate is re-evaluated
+// on every sync, a Degraded dependency would keep failing it.
 func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (ready bool, msg string, terminal bool, err error) {
 	if requireHealthy {
 		healthStatus, found, nestedErr := unstructured.NestedString(app.Object, "status", "health", "status")
@@ -663,8 +703,7 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 			return false, "status.health.status not present (application may still be initializing)", false, nil
 		}
 		if healthStatus != "Healthy" {
-			isTerminal := healthStatus == "Degraded" || healthStatus == "Missing"
-			return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), isTerminal, nil
+			return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), false, nil
 		}
 	}
 
@@ -743,7 +782,9 @@ func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneratio
 		return false, "status.conditions not present (helmrelease may still be initializing)", false, nil
 	}
 
-	condStatus := func(want string) (string, string, bool) {
+	// Returns the condition's status and reason. Deliberately not its message: see
+	// the note above about not re-publishing upstream text.
+	condStatus := func(want string) (status, reason string, found bool) {
 		for _, raw := range conds {
 			c, ok := raw.(map[string]any)
 			if !ok {
@@ -752,30 +793,36 @@ func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneratio
 			if strOr(c["type"], "") != want {
 				continue
 			}
-			return strOr(c["status"], ""), strOr(c["message"], ""), true
+			return strOr(c["status"], ""), strOr(c["reason"], ""), true
 		}
 		return "", "", false
 	}
 
 	// Stalled is checked before Ready so the message says why, not just "not ready".
-	if status, stalledMsg, ok := condStatus("Stalled"); ok && status == "True" {
-		if stalledMsg != "" {
-			return false, "helmrelease Stalled=True (will not retry until spec changes): " + stalledMsg, true, nil
-		}
-		return false, "helmrelease Stalled=True (will not retry until spec changes)", true, nil
+	if status, reason, ok := condStatus("Stalled"); ok && status == "True" {
+		return false, withReason("helmrelease Stalled=True (will not retry until spec changes)", reason), true, nil
 	}
 
-	status, readyMsg, ok := condStatus("Ready")
+	status, reason, ok := condStatus("Ready")
 	if !ok {
 		return false, "no Ready condition present (helmrelease may still be initializing)", false, nil
 	}
 	if status != "True" {
-		if readyMsg != "" {
-			return false, fmt.Sprintf("Ready=%s: %s", status, readyMsg), false, nil
-		}
-		return false, fmt.Sprintf("Ready=%s", status), false, nil
+		return false, withReason(fmt.Sprintf("Ready=%s", status), reason), false, nil
 	}
 	return true, "helmrelease Ready=True", false, nil
+}
+
+// withReason appends an upstream condition's reason, which controllers draw from a
+// bounded vocabulary. Upstream *messages* are not appended: they wrap arbitrary
+// third-party text (a Helm error quoting an admission webhook, which may quote the
+// rejected object's field values), and a Gate's status is readable by anyone who
+// can read its namespace and is re-published into the Argo CD UI.
+func withReason(msg, reason string) string {
+	if reason == "" {
+		return msg
+	}
+	return msg + " (" + reason + ")"
 }
 
 func podReady(p *corev1.Pod) bool {
@@ -787,24 +834,52 @@ func podReady(p *corev1.Pod) bool {
 	return false
 }
 
+// countReadyAddressesForService counts the ready backends behind a Service.
+//
+// The EndpointSlice controller writes one slice per addressType, so a dual-stack
+// Service has an IPv4 slice and an IPv6 slice describing the *same* pods. Summing
+// across slices would therefore count every backend once per address family and
+// satisfy minReadyAddresses with half the pods. Taking the maximum across families
+// is correct on IPv4-only, IPv6-only and dual-stack clusters without hard-coding a
+// family. FQDN slices are ignored: the EndpointSlice controller doesn't produce
+// them for selector-based Services, so one appearing means something else wrote it
+// and letting it win the maximum would change what the count means.
 func countReadyAddressesForService(ctx context.Context, kube kubernetes.Interface, ns, svcName string) (int64, error) {
 	lbl := fmt.Sprintf("kubernetes.io/service-name=%s", svcName)
 	slices, err := kube.DiscoveryV1().EndpointSlices(ns).List(ctx, metav1.ListOptions{LabelSelector: lbl})
 	if err != nil {
 		return 0, err
 	}
-	var ready int64
+
+	perFamily := map[discoveryv1.AddressType]int64{}
 	for i := range slices.Items {
-		ready += readyAddresses(&slices.Items[i])
+		es := &slices.Items[i]
+		if es.AddressType != discoveryv1.AddressTypeIPv4 && es.AddressType != discoveryv1.AddressTypeIPv6 {
+			continue
+		}
+		perFamily[es.AddressType] += readyEndpoints(es)
+	}
+
+	var ready int64
+	for _, n := range perFamily {
+		if n > ready {
+			ready = n
+		}
 	}
 	return ready, nil
 }
 
-func readyAddresses(es *discoveryv1.EndpointSlice) int64 {
+// readyEndpoints counts ready endpoints, not addresses. Endpoints[].Addresses is
+// the address list for a single endpoint — upstream requires at least one entry
+// and tells consumers to use the first — so summing its length would count one pod
+// as several.
+func readyEndpoints(es *discoveryv1.EndpointSlice) int64 {
 	var n int64
 	for _, ep := range es.Endpoints {
+		// A nil Ready is "ready" per upstream, but controller-managed slices always
+		// set it, and failing closed is the right direction for a gate.
 		if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
-			n += int64(len(ep.Addresses))
+			n++
 		}
 	}
 	return n
@@ -816,11 +891,21 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 	status metav1.ConditionStatus, reason, message string, results []EvalResult) error {
 
 	gen := gate.GetGeneration()
+	prevStatus, prevTransition := readyConditionOf(gate)
+
 	transition := metav1.Now().UTC().Format(time.RFC3339)
 	// metav1 semantics: lastTransitionTime marks the last time the status changed,
 	// not the last time it was observed. Inherit it unless the status flipped.
-	if prevStatus, prevTransition := readyConditionOf(gate); prevStatus == string(status) && prevTransition != "" {
+	if prevStatus == string(status) && prevTransition != "" {
 		transition = prevTransition
+	}
+
+	// Log transitions only. Every sweep re-evaluating every Gate makes per-sweep
+	// logging pure volume, while the question worth answering later is when a Gate
+	// changed and why — which status.results overwrites.
+	if prevStatus != string(status) {
+		log.Printf("gate %s/%s: %s -> %s (%s) %s",
+			gate.GetNamespace(), gate.GetName(), orNone(prevStatus), status, reason, message)
 	}
 
 	patch := map[string]any{
@@ -900,26 +985,24 @@ func truncate(s string) string {
 	return s[:maxMessageLen-3] + "..."
 }
 
-func parseCSVSet(s string) map[string]bool {
-	out := map[string]bool{}
+// parseCSV drops empty entries, which matters for the allowlists: a trailing comma
+// must not produce an empty prefix, since strings.HasPrefix(ns, "") matches every
+// namespace.
+func parseCSV(s string) []string {
+	out := []string{}
 	for _, part := range strings.Split(s, ",") {
-		p := strings.TrimSpace(part)
-		if p != "" {
-			out[p] = true
+		if p := strings.TrimSpace(part); p != "" {
+			out = append(out, p)
 		}
 	}
 	return out
 }
 
-func parseCSVList(s string) []string {
-	out := []string{}
-	for _, part := range strings.Split(s, ",") {
-		p := strings.TrimSpace(part)
-		if p != "" {
-			out = append(out, p)
-		}
+func orNone(s string) string {
+	if s == "" {
+		return "<none>"
 	}
-	return out
+	return s
 }
 
 func strOr(v any, def string) string {

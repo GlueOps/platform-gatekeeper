@@ -22,12 +22,24 @@ Three things decide whether this works:
    `0` shares a wave with every un-annotated resource and orders nothing.
 3. **The Gate must be in the same Application** as the workloads it gates. Sync
    waves only order resources within a single sync.
+4. **The Gate must express steady state.** It is re-evaluated on every sync, so the
+   condition has to stay true for the life of the Application — see the note in
+   `wave-gating/gate.yaml` about why gating on a migration Job eventually wedges.
 
 ## Platform setup: `argocd-health-check.yaml`
 
-The Lua health check that teaches Argo CD how to read a Gate. Merge it into the
-existing `argocd-cm` (don't replace the ConfigMap — it holds other settings).
-Applied once per Argo CD instance.
+The Lua health check that teaches Argo CD how to read a Gate, applied once per Argo
+CD instance:
+
+```bash
+kubectl patch configmap argocd-cm -n argocd --type merge \
+  --patch-file examples/argocd-health-check.yaml
+```
+
+It is a patch fragment, not a full ConfigMap, deliberately: `kubectl apply` of a
+one-key `argocd-cm` manifest would delete every other key in the live ConfigMap, and
+Argo CD would then selfHeal it back — silently removing the health check and
+un-gating every Gate in the cluster.
 
 Your platform also needs `--sync-timeout` (or
 `ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT`) set on the application controller. It
@@ -68,7 +80,7 @@ kubectl wait --for=condition=Ready --timeout=5m gate/my-app-dependencies -n nonp
 | --- | --- |
 | `Ready` | every check passed |
 | `DependenciesNotReady` | still waiting; this should resolve on its own |
-| `Terminal` | a failed Job, Degraded Application or stalled HelmRelease — it will not recover without a change, so stop waiting |
+| `Terminal` | the upstream controller gave up — a failed Job, a stalled HelmRelease. It will not recover without a change, so stop waiting |
 | `PolicyViolation` | the Gate references a namespace it isn't allowed to read |
 | `ReadForbidden` | gatekeeper's own ClusterRole is missing a kind; the message names it |
 | `InvalidSpec` | the Gate itself is malformed |

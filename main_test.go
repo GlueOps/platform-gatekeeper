@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -25,7 +27,7 @@ import (
 
 func TestPlatformNSAllowed(t *testing.T) {
 	s := &Server{
-		platformAllowedNS:       map[string]bool{"glueops-core": true, "nonprod": true},
+		platformAllowedNS:       []string{"glueops-core", "nonprod"},
 		platformAllowedPrefixes: []string{"glueops-core-"},
 	}
 
@@ -53,13 +55,17 @@ func TestPlatformNSAllowed(t *testing.T) {
 // An operator who forgets the allowlist env vars must get no cross-namespace
 // access, rather than the previously hardcoded defaults.
 func TestPlatformNSAllowedEmptyByDefault(t *testing.T) {
-	s := &Server{
-		platformAllowedNS:       parseCSVSet(""),
-		platformAllowedPrefixes: parseCSVList(""),
-	}
-	for _, ns := range []string{"glueops-core", "nonprod", "glueops-core-gatekeeper", "anything"} {
-		if s.platformNSAllowed(ns) {
-			t.Errorf("platformNSAllowed(%q) = true with an unset allowlist, want false", ns)
+	// A trailing comma or a whitespace-only value must not yield an empty prefix:
+	// strings.HasPrefix(ns, "") matches every namespace.
+	for _, raw := range []string{"", " ", ",", ",,", " , ", "\t"} {
+		s := &Server{
+			platformAllowedNS:       parseCSV(raw),
+			platformAllowedPrefixes: parseCSV(raw),
+		}
+		for _, ns := range []string{"glueops-core", "nonprod", "glueops-core-gatekeeper", "anything"} {
+			if s.platformNSAllowed(ns) {
+				t.Errorf("parseCSV(%q): platformNSAllowed(%q) = true, want false", raw, ns)
+			}
 		}
 	}
 }
@@ -230,20 +236,21 @@ func TestJobComplete(t *testing.T) {
 			// A failed Job will never complete on its own, so this must be
 			// terminal: a poller that treats it as "not yet" waits out its whole
 			// timeout for something that cannot happen.
-			name: "failed is terminal",
+			name: "failed is terminal, and echoes the reason not the message",
 			job: &batchv1.Job{
 				Status: batchv1.JobStatus{
 					Conditions: []batchv1.JobCondition{
-						{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Message: "OOM"},
+						{Type: batchv1.JobFailed, Status: corev1.ConditionTrue,
+							Reason: "BackoffLimitExceeded", Message: "pod failed: SECRET-VALUE"},
 					},
 				},
 			},
 			wantReady:    false,
-			wantMsg:      "job Failed=True: OOM",
+			wantMsg:      "job Failed=True (BackoffLimitExceeded)",
 			wantTerminal: true,
 		},
 		{
-			name: "failed no message is terminal",
+			name: "failed without a reason is still terminal",
 			job: &batchv1.Job{
 				Status: batchv1.JobStatus{
 					Conditions: []batchv1.JobCondition{
@@ -307,10 +314,12 @@ func TestArgoAppReady(t *testing.T) {
 	}{
 		{"healthy and synced", makeApp("Healthy", "Synced"), true, true, true, false, false},
 		{"healthy not synced", makeApp("Healthy", "OutOfSync"), true, true, false, false, false},
-		// Degraded will not recover without a change, so waiting is pointless.
-		{"degraded is terminal", makeApp("Degraded", "Synced"), true, true, false, true, false},
-		{"missing is terminal", makeApp("Missing", "Synced"), true, true, false, true, false},
-		// Progressing is a transient state, so it must not be terminal.
+		// Argo CD health is a rollup over an Application's resources, not a
+		// statement that its controller gave up, so none of these is terminal.
+		// Missing in particular is the normal state of an Application whose
+		// resources are not live yet -- exactly what a Gate should wait for.
+		{"degraded is not terminal", makeApp("Degraded", "Synced"), true, true, false, false, false},
+		{"missing is not terminal", makeApp("Missing", "Synced"), true, true, false, false, false},
 		{"progressing is not terminal", makeApp("Progressing", "Synced"), true, true, false, false, false},
 		{"healthy only required", makeApp("Healthy", "OutOfSync"), false, true, true, false, false},
 		{"health not checked when not required", makeApp("Degraded", "Synced"), true, false, true, false, false},
@@ -382,14 +391,17 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 		}
 		return obj
 	}
-	cond := func(t, s, m string) any {
-		return map[string]any{"type": t, "status": s, "message": m}
+	cond := func(t, s, reason, m string) any {
+		return map[string]any{"type": t, "status": s, "reason": reason, "message": m}
 	}
-	ready := []any{cond("Ready", "True", "Helm install succeeded")}
-	notReady := []any{cond("Ready", "False", "install retries exhausted")}
+	// The messages carry a marker so the tests below can prove upstream text is
+	// never republished: a real one wraps a Helm error, which may wrap an admission
+	// webhook quoting the rejected object's field values.
+	ready := []any{cond("Ready", "True", "InstallSucceeded", "Helm install succeeded")}
+	notReady := []any{cond("Ready", "False", "InstallFailed", "LEAKED-UPSTREAM-TEXT")}
 	stalled := []any{
-		cond("Ready", "False", "install retries exhausted"),
-		cond("Stalled", "True", "exhausted 3 retries"),
+		cond("Ready", "False", "InstallFailed", "LEAKED-UPSTREAM-TEXT"),
+		cond("Stalled", "True", "RetriesExceeded", "LEAKED-UPSTREAM-TEXT"),
 	}
 
 	tests := []struct {
@@ -412,7 +424,7 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 		// Stalled means helm-controller has given up until the spec changes, so
 		// unlike a plain not-ready it must not be waited out.
 		{"stalled is terminal", makeHR(1, 1, stalled), true, false, true, false},
-		{"conditions present but no Ready", makeHR(1, 1, []any{cond("Released", "True", "")}), true, false, false, false},
+		{"conditions present but no Ready", makeHR(1, 1, []any{cond("Released", "True", "", "")}), true, false, false, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -431,23 +443,35 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 
 	// Stalled must be distinguishable from a plain not-Ready: a poller that cannot
 	// tell them apart burns its whole timeout on a release that will never recover.
-	t.Run("stalled message names the condition", func(t *testing.T) {
+	t.Run("stalled names the condition and its reason", func(t *testing.T) {
 		_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, stalled), true)
 		if !strings.Contains(msg, "Stalled=True") {
 			t.Errorf("stalled message = %q, want it to mention Stalled=True", msg)
 		}
-		if !strings.Contains(msg, "exhausted 3 retries") {
-			t.Errorf("stalled message = %q, want the controller message included", msg)
+		if !strings.Contains(msg, "RetriesExceeded") {
+			t.Errorf("stalled message = %q, want the condition reason included", msg)
 		}
 	})
 
-	t.Run("not-ready message carries the controller message", func(t *testing.T) {
+	t.Run("not-ready carries the reason but never the upstream message", func(t *testing.T) {
 		_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, notReady), true)
-		if !strings.Contains(msg, "install retries exhausted") {
-			t.Errorf("not-ready message = %q, want the controller message included", msg)
+		if !strings.Contains(msg, "InstallFailed") {
+			t.Errorf("not-ready message = %q, want the condition reason included", msg)
 		}
 		if strings.Contains(msg, "Stalled") {
 			t.Errorf("not-ready message = %q, must not claim Stalled", msg)
+		}
+	})
+
+	// A Gate's status is readable by anyone who can read its namespace, and the
+	// Argo CD health check republishes it into the UI, so upstream condition
+	// messages must not travel.
+	t.Run("upstream condition messages are never republished", func(t *testing.T) {
+		for name, conds := range map[string][]any{"not ready": notReady, "stalled": stalled} {
+			_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, conds), true)
+			if strings.Contains(msg, "LEAKED-UPSTREAM-TEXT") {
+				t.Errorf("%s: message = %q, must not echo the upstream condition message", name, msg)
+			}
 		}
 	})
 
@@ -482,7 +506,7 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 	})
 
 	t.Run("malformed condition entries are skipped, not fatal", func(t *testing.T) {
-		hr := makeHR(1, 1, []any{"garbage", cond("Ready", "True", "")})
+		hr := makeHR(1, 1, []any{"garbage", cond("Ready", "True", "", "")})
 		got, _, _, err := fluxHelmReleaseReady(hr, true)
 		if err != nil {
 			t.Errorf("unexpected error: %v", err)
@@ -540,7 +564,7 @@ func TestPodReady(t *testing.T) {
 
 // --- readyAddresses ---
 
-func TestReadyAddresses(t *testing.T) {
+func TestReadyEndpoints(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 
 	tests := []struct {
@@ -549,14 +573,16 @@ func TestReadyAddresses(t *testing.T) {
 		want int64
 	}{
 		{
-			name: "two ready endpoints with addresses",
+			// Endpoints[].Addresses holds alternate addresses for one endpoint, so
+			// two ready pods are two backends however many addresses they carry.
+			name: "counts endpoints, not addresses",
 			es: &discoveryv1.EndpointSlice{
 				Endpoints: []discoveryv1.Endpoint{
 					{Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}, Addresses: []string{"10.0.0.1", "10.0.0.2"}},
 					{Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}, Addresses: []string{"10.0.0.3"}},
 				},
 			},
-			want: 3,
+			want: 2,
 		},
 		{
 			name: "mixed ready and not ready",
@@ -569,7 +595,7 @@ func TestReadyAddresses(t *testing.T) {
 			want: 1,
 		},
 		{
-			name: "nil ready",
+			name: "nil ready fails closed",
 			es: &discoveryv1.EndpointSlice{
 				Endpoints: []discoveryv1.Endpoint{
 					{Conditions: discoveryv1.EndpointConditions{Ready: nil}, Addresses: []string{"10.0.0.1"}},
@@ -585,8 +611,70 @@ func TestReadyAddresses(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := readyAddresses(tt.es); got != tt.want {
-				t.Errorf("readyAddresses() = %d, want %d", got, tt.want)
+			if got := readyEndpoints(tt.es); got != tt.want {
+				t.Errorf("readyEndpoints() = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// A dual-stack Service has one slice per address family describing the same pods,
+// so the count must not add them together.
+func TestCountReadyAddressesIsNotInflatedByDualStack(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+	readySlice := func(name string, at discoveryv1.AddressType, addrs ...string) *discoveryv1.EndpointSlice {
+		eps := make([]discoveryv1.Endpoint, 0, len(addrs))
+		for _, a := range addrs {
+			eps = append(eps, discoveryv1.Endpoint{
+				Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)},
+				Addresses:  []string{a},
+			})
+		}
+		return &discoveryv1.EndpointSlice{
+			ObjectMeta:  metav1.ObjectMeta{Name: name, Namespace: "nonprod", Labels: map[string]string{"kubernetes.io/service-name": "redis"}},
+			AddressType: at,
+			Endpoints:   eps,
+		}
+	}
+
+	tests := []struct {
+		name   string
+		slices []runtime.Object
+		want   int64
+	}{
+		{
+			name:   "single stack",
+			slices: []runtime.Object{readySlice("redis-v4", discoveryv1.AddressTypeIPv4, "10.0.0.1", "10.0.0.2")},
+			want:   2,
+		},
+		{
+			// Two real pods, described twice. Summing would report 4.
+			name: "dual stack counts each backend once",
+			slices: []runtime.Object{
+				readySlice("redis-v4", discoveryv1.AddressTypeIPv4, "10.0.0.1", "10.0.0.2"),
+				readySlice("redis-v6", discoveryv1.AddressTypeIPv6, "fd00::1", "fd00::2"),
+			},
+			want: 2,
+		},
+		{
+			name: "an FQDN slice is ignored",
+			slices: []runtime.Object{
+				readySlice("redis-v4", discoveryv1.AddressTypeIPv4, "10.0.0.1"),
+				readySlice("redis-fqdn", discoveryv1.AddressTypeFQDN, "a.example", "b.example", "c.example"),
+			},
+			want: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			kube := kubefake.NewSimpleClientset(tt.slices...)
+			got, err := countReadyAddressesForService(context.Background(), kube, "nonprod", "redis")
+			if err != nil {
+				t.Fatalf("countReadyAddressesForService: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("ready addresses = %d, want %d", got, tt.want)
 			}
 		})
 	}
@@ -625,51 +713,27 @@ func TestCountCheckTypes(t *testing.T) {
 
 // --- small helpers ---
 
-func TestParseCSVSet(t *testing.T) {
-	tests := []struct {
-		input string
-		want  map[string]bool
-	}{
-		{"a,b,c", map[string]bool{"a": true, "b": true, "c": true}},
-		{" a , b ", map[string]bool{"a": true, "b": true}},
-		{"single", map[string]bool{"single": true}},
-		{"", map[string]bool{}},
-		{",,,", map[string]bool{}},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			got := parseCSVSet(tt.input)
-			if len(got) != len(tt.want) {
-				t.Fatalf("parseCSVSet(%q) len = %d, want %d", tt.input, len(got), len(tt.want))
-			}
-			for k := range tt.want {
-				if !got[k] {
-					t.Errorf("parseCSVSet(%q) missing key %q", tt.input, k)
-				}
-			}
-		})
-	}
-}
-
-func TestParseCSVList(t *testing.T) {
+func TestParseCSV(t *testing.T) {
 	tests := []struct {
 		input string
 		want  []string
 	}{
 		{"a,b,c", []string{"a", "b", "c"}},
 		{" a , b ", []string{"a", "b"}},
+		{"single", []string{"single"}},
 		{"", nil},
 		{",,,", nil},
+		{" , ", nil},
 	}
 	for _, tt := range tests {
 		t.Run(tt.input, func(t *testing.T) {
-			got := parseCSVList(tt.input)
+			got := parseCSV(tt.input)
 			if len(got) != len(tt.want) {
-				t.Fatalf("parseCSVList(%q) len = %d, want %d", tt.input, len(got), len(tt.want))
+				t.Fatalf("parseCSV(%q) = %v, want %v", tt.input, got, tt.want)
 			}
 			for i, v := range tt.want {
 				if got[i] != v {
-					t.Errorf("parseCSVList(%q)[%d] = %q, want %q", tt.input, i, got[i], v)
+					t.Errorf("parseCSV(%q)[%d] = %q, want %q", tt.input, i, got[i], v)
 				}
 			}
 		})
@@ -774,10 +838,16 @@ func availableDeployment(ns, name string) *appsv1.Deployment {
 	}
 }
 
+var (
+	testArgoGVR = schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+	testFluxGVR = schema.GroupVersionResource{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
+)
+
 // newTestServer wires a Server onto fake clients. mode is the value of the
 // namespace mode label on "nonprod"; an empty string leaves it unlabelled, which
-// means customer mode.
-func newTestServer(t *testing.T, mode string, kubeObjs []runtime.Object, gates ...runtime.Object) *Server {
+// means customer mode. dynObjs holds Gates and any custom resources checks point
+// at (Argo CD Applications, Flux HelmReleases).
+func newTestServer(t *testing.T, mode string, kubeObjs []runtime.Object, dynObjs ...runtime.Object) *Server {
 	t.Helper()
 
 	nonprod := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "nonprod"}}
@@ -788,18 +858,31 @@ func newTestServer(t *testing.T, mode string, kubeObjs []runtime.Object, gates .
 
 	dyn := dynamicfake.NewSimpleDynamicClientWithCustomListKinds(
 		runtime.NewScheme(),
-		map[schema.GroupVersionResource]string{testGateGVR: "GateList"},
-		gates...,
+		map[schema.GroupVersionResource]string{
+			testGateGVR: "GateList",
+			testArgoGVR: "ApplicationList",
+			testFluxGVR: "HelmReleaseList",
+		},
+		dynObjs...,
 	)
 
 	return &Server{
 		kube:                    kube,
 		dyn:                     dyn,
 		gateGVR:                 testGateGVR,
-		platformAllowedNS:       map[string]bool{"glueops-core": true},
+		platformAllowedNS:       []string{"glueops-core"},
 		platformAllowedPrefixes: []string{"glueops-core-"},
 		reconcileInterval:       time.Second,
 	}
+}
+
+func unstructuredObj(apiVersion, kind, ns, name string, status map[string]any) *unstructured.Unstructured {
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata":   map[string]any{"name": name, "namespace": ns, "generation": int64(1)},
+		"status":     status,
+	}}
 }
 
 func readyConditionFields(t *testing.T, s *Server, ns, name string) (status, reason, message, transition string) {
@@ -976,24 +1059,48 @@ func TestModeEnforcement(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := newTestServer(t, tt.mode, nil)
-			results := s.evaluateGate(context.Background(), modeOrDefault(tt.mode), "nonprod",
-				testGate("nonprod", "app", 1, tt.check))
-			if len(results) != 1 {
-				t.Fatalf("got %d results, want 1", len(results))
-			}
-			if got := resultReason(results[0]); got != tt.wantReason {
-				t.Errorf("reason = %q, want %q (message: %s)", got, tt.wantReason, results[0].Message)
+			// Deliberately driven through reconcileOnce rather than calling
+			// evaluateGate with a hand-computed mode: the namespace label is the
+			// policy boundary, so namespaceMode has to be the thing under test.
+			gate := testGate("nonprod", "app", 1, tt.check)
+			s := newTestServer(t, tt.mode, nil, gate)
+
+			s.reconcileOnce(context.Background())
+
+			_, reason, message, _ := readyConditionFields(t, s, "nonprod", "app")
+			if reason != tt.wantReason {
+				t.Errorf("reason = %q, want %q (message: %s)", reason, tt.wantReason, message)
 			}
 		})
 	}
 }
 
-func modeOrDefault(mode string) string {
-	if mode == modePlatform {
-		return modePlatform
+// The mode label is read with ToLower/TrimSpace, so confirm the normalisation
+// actually grants platform mode rather than silently falling back to customer.
+func TestNamespaceModeNormalisation(t *testing.T) {
+	tests := []struct {
+		label string
+		want  string
+	}{
+		{"platform", modePlatform},
+		{"Platform", modePlatform},
+		{"  PLATFORM  ", modePlatform},
+		{"customer", modeCustomer},
+		{"", modeCustomer},
+		{"nonsense", modeCustomer},
 	}
-	return modeCustomer
+	for _, tt := range tests {
+		t.Run(tt.label, func(t *testing.T) {
+			s := newTestServer(t, tt.label, nil)
+			got, err := s.namespaceMode(context.Background(), "nonprod")
+			if err != nil {
+				t.Fatalf("namespaceMode: %v", err)
+			}
+			if got != tt.want {
+				t.Errorf("namespaceMode(label=%q) = %q, want %q", tt.label, got, tt.want)
+			}
+		})
+	}
 }
 
 // If the namespace mode can't be resolved, gatekeeper cannot know which policy
@@ -1106,8 +1213,8 @@ func TestInvalidCheckSpec(t *testing.T) {
 			if len(results) != 1 {
 				t.Fatalf("got %d results, want 1", len(results))
 			}
-			if resultReason(results[0]) != reasonInvalidSpec {
-				t.Errorf("reason = %q, want %q", resultReason(results[0]), reasonInvalidSpec)
+			if results[0].Reason != reasonInvalidSpec {
+				t.Errorf("reason = %q, want %q", results[0].Reason, reasonInvalidSpec)
 			}
 		})
 	}
@@ -1124,5 +1231,350 @@ func TestTruncate(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "...") {
 		t.Errorf("truncated message should end in an ellipsis, got %q", got[len(got)-10:])
+	}
+}
+
+// Every check type must actually dispatch. The option names and the two custom
+// GVRs in evalOne are string literals hand-matched against crd.yaml, and a typo in
+// any of them fails silently — the key lookup misses, numOr/boolOr return the
+// default, and the predicate unit tests still pass because they take the value as
+// an argument. This is the test that catches that class.
+func TestEveryCheckTypeDispatches(t *testing.T) {
+	boolPtr := func(b bool) *bool { return &b }
+
+	readyPod := func(name string) *corev1.Pod {
+		return &corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "nonprod", Labels: map[string]string{"app": "worker"}},
+			Status: corev1.PodStatus{Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			}},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		check    map[string]any
+		kubeObjs []runtime.Object
+		dynObjs  []runtime.Object
+		wantPass bool
+	}{
+		{
+			name:     "deploymentAvailable satisfied",
+			check:    map[string]any{"id": "c", "deploymentAvailable": map[string]any{"name": "d", "minAvailableReplicas": int64(2)}},
+			kubeObjs: []runtime.Object{deploymentWithAvailable("nonprod", "d", 2)},
+			wantPass: true,
+		},
+		{
+			// Proves minAvailableReplicas is read rather than silently defaulted to 1.
+			name:     "deploymentAvailable respects minAvailableReplicas",
+			check:    map[string]any{"id": "c", "deploymentAvailable": map[string]any{"name": "d", "minAvailableReplicas": int64(3)}},
+			kubeObjs: []runtime.Object{deploymentWithAvailable("nonprod", "d", 2)},
+			wantPass: false,
+		},
+		{
+			name:  "statefulSetReady satisfied",
+			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "minReadyReplicas": int64(2)}},
+			kubeObjs: []runtime.Object{&appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "nonprod"},
+				Status:     appsv1.StatefulSetStatus{ReadyReplicas: 2, CurrentRevision: "r1", UpdateRevision: "r1"},
+			}},
+			wantPass: true,
+		},
+		{
+			// Proves requireUpdatedRevision is read; with it defaulted true this
+			// mid-rollout StatefulSet must not pass.
+			name:  "statefulSetReady honours requireUpdatedRevision",
+			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "requireUpdatedRevision": true}},
+			kubeObjs: []runtime.Object{&appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "nonprod"},
+				Status:     appsv1.StatefulSetStatus{ReadyReplicas: 2, CurrentRevision: "r1", UpdateRevision: "r2"},
+			}},
+			wantPass: false,
+		},
+		{
+			name:  "jobComplete satisfied",
+			check: map[string]any{"id": "c", "jobComplete": map[string]any{"name": "j"}},
+			kubeObjs: []runtime.Object{&batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "nonprod"},
+				Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{
+					{Type: batchv1.JobComplete, Status: corev1.ConditionTrue},
+				}},
+			}},
+			wantPass: true,
+		},
+		{
+			name:  "serviceReadyEndpoints satisfied",
+			check: map[string]any{"id": "c", "serviceReadyEndpoints": map[string]any{"name": "svc", "minReadyAddresses": int64(2)}},
+			kubeObjs: []runtime.Object{
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "nonprod"}},
+				&discoveryv1.EndpointSlice{
+					ObjectMeta:  metav1.ObjectMeta{Name: "svc-1", Namespace: "nonprod", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+					AddressType: discoveryv1.AddressTypeIPv4,
+					Endpoints: []discoveryv1.Endpoint{
+						{Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}, Addresses: []string{"10.0.0.1"}},
+						{Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}, Addresses: []string{"10.0.0.2"}},
+					},
+				},
+			},
+			wantPass: true,
+		},
+		{
+			// Proves minReadyAddresses is read; one backend must not satisfy two.
+			name:  "serviceReadyEndpoints respects minReadyAddresses",
+			check: map[string]any{"id": "c", "serviceReadyEndpoints": map[string]any{"name": "svc", "minReadyAddresses": int64(2)}},
+			kubeObjs: []runtime.Object{
+				&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "svc", Namespace: "nonprod"}},
+				&discoveryv1.EndpointSlice{
+					ObjectMeta:  metav1.ObjectMeta{Name: "svc-1", Namespace: "nonprod", Labels: map[string]string{"kubernetes.io/service-name": "svc"}},
+					AddressType: discoveryv1.AddressTypeIPv4,
+					Endpoints: []discoveryv1.Endpoint{
+						{Conditions: discoveryv1.EndpointConditions{Ready: boolPtr(true)}, Addresses: []string{"10.0.0.1", "10.0.0.9"}},
+					},
+				},
+			},
+			wantPass: false,
+		},
+		{
+			name:     "podLabelReady satisfied",
+			check:    map[string]any{"id": "c", "podLabelReady": map[string]any{"selector": "app=worker", "minReadyPods": int64(2)}},
+			kubeObjs: []runtime.Object{readyPod("w1"), readyPod("w2")},
+			wantPass: true,
+		},
+		{
+			// Proves minReadyPods is read rather than defaulted to 1.
+			name:     "podLabelReady respects minReadyPods",
+			check:    map[string]any{"id": "c", "podLabelReady": map[string]any{"selector": "app=worker", "minReadyPods": int64(3)}},
+			kubeObjs: []runtime.Object{readyPod("w1"), readyPod("w2")},
+			wantPass: false,
+		},
+		{
+			name:  "argoApplicationHealthy satisfied",
+			check: map[string]any{"id": "c", "argoApplicationHealthy": map[string]any{"name": "app"}},
+			dynObjs: []runtime.Object{unstructuredObj("argoproj.io/v1alpha1", "Application", "nonprod", "app", map[string]any{
+				"health": map[string]any{"status": "Healthy"},
+				"sync":   map[string]any{"status": "Synced"},
+			})},
+			wantPass: true,
+		},
+		{
+			// Proves requireSynced is read: OutOfSync must block by default.
+			name:  "argoApplicationHealthy honours requireSynced",
+			check: map[string]any{"id": "c", "argoApplicationHealthy": map[string]any{"name": "app"}},
+			dynObjs: []runtime.Object{unstructuredObj("argoproj.io/v1alpha1", "Application", "nonprod", "app", map[string]any{
+				"health": map[string]any{"status": "Healthy"},
+				"sync":   map[string]any{"status": "OutOfSync"},
+			})},
+			wantPass: false,
+		},
+		{
+			name:  "fluxHelmReleaseReady satisfied",
+			check: map[string]any{"id": "c", "fluxHelmReleaseReady": map[string]any{"name": "hr"}},
+			dynObjs: []runtime.Object{unstructuredObj("helm.toolkit.fluxcd.io/v2", "HelmRelease", "nonprod", "hr", map[string]any{
+				"observedGeneration": int64(1),
+				"conditions": []any{map[string]any{
+					"type": "Ready", "status": "True", "reason": "InstallSucceeded",
+				}},
+			})},
+			wantPass: true,
+		},
+		{
+			// Proves requireCurrentGeneration is read: a stale observedGeneration
+			// must block even though Ready=True.
+			name:  "fluxHelmReleaseReady honours requireCurrentGeneration",
+			check: map[string]any{"id": "c", "fluxHelmReleaseReady": map[string]any{"name": "hr"}},
+			dynObjs: []runtime.Object{func() runtime.Object {
+				o := unstructuredObj("helm.toolkit.fluxcd.io/v2", "HelmRelease", "nonprod", "hr", map[string]any{
+					"observedGeneration": int64(1),
+					"conditions": []any{map[string]any{
+						"type": "Ready", "status": "True", "reason": "InstallSucceeded",
+					}},
+				})
+				_ = unstructured.SetNestedField(o.Object, int64(5), "metadata", "generation")
+				return o
+			}()},
+			wantPass: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gate := testGate("nonprod", "g", 1, tt.check)
+			dyn := append([]runtime.Object{gate}, tt.dynObjs...)
+			s := newTestServer(t, "", tt.kubeObjs, dyn...)
+
+			s.reconcileOnce(context.Background())
+
+			status, reason, message, _ := readyConditionFields(t, s, "nonprod", "g")
+			if tt.wantPass {
+				if status != string(metav1.ConditionTrue) {
+					t.Errorf("status = %q reason = %q message = %q, want True", status, reason, message)
+				}
+				return
+			}
+			if status == string(metav1.ConditionTrue) {
+				t.Errorf("status = True, want the check to block (message: %s)", message)
+			}
+			// A blocked check must be a verdict, not a failure to look.
+			if reason != reasonDependenciesNotReady {
+				t.Errorf("reason = %q, want %q (message: %s)", reason, reasonDependenciesNotReady, message)
+			}
+		})
+	}
+}
+
+func deploymentWithAvailable(ns, name string, available int32) *appsv1.Deployment {
+	return &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns},
+		Status: appsv1.DeploymentStatus{
+			AvailableReplicas: available,
+			Conditions: []appsv1.DeploymentCondition{
+				{Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue},
+			},
+		},
+	}
+}
+
+// Terminal is the signal that makes Argo CD fail a gated sync promptly instead of
+// waiting out --sync-timeout, so the plumbing that produces it needs covering end
+// to end, not just summarize's precedence.
+func TestTerminalReachesConditionAndResults(t *testing.T) {
+	gate := testGate("nonprod", "g", 1, map[string]any{
+		"id":          "migration",
+		"jobComplete": map[string]any{"name": "j"},
+	})
+	failedJob := &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: "j", Namespace: "nonprod"},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{
+			{Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded"},
+		}},
+	}
+	s := newTestServer(t, "", []runtime.Object{failedJob}, gate)
+
+	s.reconcileOnce(context.Background())
+
+	status, reason, _, _ := readyConditionFields(t, s, "nonprod", "g")
+	if status != string(metav1.ConditionFalse) {
+		t.Errorf("status = %q, want False", status)
+	}
+	if reason != reasonTerminal {
+		t.Errorf("reason = %q, want %q", reason, reasonTerminal)
+	}
+
+	got, err := s.dyn.Resource(testGateGVR).Namespace("nonprod").Get(context.Background(), "g", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get gate: %v", err)
+	}
+	results, _, _ := unstructured.NestedSlice(got.Object, "status", "results")
+	if len(results) != 1 {
+		t.Fatalf("status.results = %v, want 1 entry", results)
+	}
+	entry, _ := results[0].(map[string]any)
+	if terminal, _ := entry["terminal"].(bool); !terminal {
+		t.Errorf("status.results[0].terminal = %v, want true", entry["terminal"])
+	}
+}
+
+// lastSweep is the only input to the staleness alert, so the cases where it must
+// NOT advance matter as much as the happy path.
+func TestSweepSuccessAccounting(t *testing.T) {
+	newGate := func() *unstructured.Unstructured {
+		return testGate("nonprod", "g", 1, map[string]any{
+			"id":                  "db",
+			"deploymentAvailable": map[string]any{"name": "d"},
+		})
+	}
+
+	t.Run("a write failure withholds the stamp", func(t *testing.T) {
+		s := newTestServer(t, "", []runtime.Object{deploymentWithAvailable("nonprod", "d", 1)}, newGate())
+		dyn := s.dyn.(*dynamicfake.FakeDynamicClient)
+		dyn.PrependReactor("patch", "gates", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("nope"))
+		})
+
+		s.reconcileOnce(context.Background())
+
+		if s.lastSweep.Load() != 0 {
+			t.Error("lastSweep was stamped despite every status write failing")
+		}
+	})
+
+	// A CRD installed without its status subresource 404s every patch. Treating
+	// that as "the Gate was deleted" would stamp a successful sweep forever while
+	// no Gate ever carries a status, and the alert would never fire.
+	t.Run("an all-404 sweep withholds the stamp", func(t *testing.T) {
+		s := newTestServer(t, "", []runtime.Object{deploymentWithAvailable("nonprod", "d", 1)}, newGate())
+		dyn := s.dyn.(*dynamicfake.FakeDynamicClient)
+		dyn.PrependReactor("patch", "gates", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "gates"}, "g")
+		})
+
+		s.reconcileOnce(context.Background())
+
+		if s.lastSweep.Load() != 0 {
+			t.Error("lastSweep was stamped on a sweep where every patch 404'd")
+		}
+	})
+
+	t.Run("a list error withholds the stamp", func(t *testing.T) {
+		s := newTestServer(t, "", nil, newGate())
+		dyn := s.dyn.(*dynamicfake.FakeDynamicClient)
+		dyn.PrependReactor("list", "gates", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("nope"))
+		})
+
+		s.reconcileOnce(context.Background())
+
+		if s.lastSweep.Load() != 0 {
+			t.Error("lastSweep was stamped despite the list failing")
+		}
+	})
+
+	t.Run("an empty cluster is a successful sweep", func(t *testing.T) {
+		s := newTestServer(t, "", nil)
+		s.reconcileOnce(context.Background())
+		if s.lastSweep.Load() == 0 {
+			t.Error("a cluster with no Gates should still count as swept")
+		}
+	})
+
+	t.Run("unevaluated gates are counted but do not withhold the stamp", func(t *testing.T) {
+		// No Deployment exists and namespace reads fail, so the Gate ends Unknown.
+		s := newTestServer(t, "", nil, newGate())
+		kube := s.kube.(*kubefake.Clientset)
+		kube.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("nope"))
+		})
+
+		s.reconcileOnce(context.Background())
+
+		if s.lastSweep.Load() == 0 {
+			t.Error("the sweep wrote a status, so it should be stamped")
+		}
+		if got := s.gatesUnknown.Load(); got != 1 {
+			t.Errorf("gatesUnknown = %d, want 1", got)
+		}
+	})
+}
+
+// The metric names here are a contract with prometheusrule.yaml; renaming either
+// side silently disables the only staleness alert.
+func TestHandleMetricsExposesTheAlertedSeries(t *testing.T) {
+	s := newTestServer(t, "", nil)
+	s.lastSweep.Store(1700000000)
+	s.gatesUnknown.Store(2)
+	s.sweepDuration.Store(1500)
+
+	rec := httptest.NewRecorder()
+	s.handleMetrics(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+
+	body := rec.Body.String()
+	for _, want := range []string{
+		"gatekeeper_last_successful_sweep_timestamp_seconds 1700000000",
+		"gatekeeper_gates_unevaluated 2",
+		"gatekeeper_sweep_duration_seconds 1.500",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("/metrics body missing %q\ngot:\n%s", want, body)
+		}
 	}
 }

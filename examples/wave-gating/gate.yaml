@@ -2,8 +2,21 @@
 # out. It goes in sync-wave -1 so Argo CD applies it, waits for it to report
 # Healthy, and only then proceeds to the default wave (0) where the workloads live.
 #
-# Wave -1 and not 0: the default wave *is* 0, so a Gate at 0 would be applied in
-# the same wave as any un-annotated resource and would gate nothing.
+# Wave -1 and not 0: the default wave *is* 0, so a Gate at 0 would be applied in the
+# same wave as any un-annotated resource and would gate nothing.
+#
+# THE RULE THAT DECIDES WHAT BELONGS HERE: a Gate is a managed resource in wave -1
+# of *every* sync, not a one-shot precondition. Each sync re-evaluates it, so the
+# condition must stay true for the life of the Application — not merely become true
+# once. Gate on steady state (a database is available, a dependency is healthy), not
+# on events.
+#
+# The classic mistake is `jobComplete` on a migration. It works until something
+# removes the Job — `ttlSecondsAfterFinished`, a `hook-delete-policy:
+# HookSucceeded` hook, Argo CD pruning it, or someone deleting it to re-run the
+# migration — and from then on every sync of this Application hangs at wave -1 until
+# --sync-timeout, with auto-sync skipped meanwhile, including the commit that would
+# fix it.
 apiVersion: platform.glueops.dev/v1alpha2
 kind: Gate
 metadata:
@@ -17,6 +30,7 @@ spec:
       deploymentAvailable:
         name: postgres
         minAvailableReplicas: 1
-    - id: migration
-      jobComplete:
-        name: my-app-migrate
+    - id: cache
+      serviceReadyEndpoints:
+        name: redis
+        minReadyAddresses: 1

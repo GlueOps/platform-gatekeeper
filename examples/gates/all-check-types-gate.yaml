@@ -17,6 +17,10 @@ spec:
         minReadyReplicas: 1
         requireUpdatedRevision: true
 
+    # jobComplete is shown for completeness, but think twice before gating on it:
+    # a Gate is re-evaluated on every sync, so once the Job is garbage-collected
+    # this check reports not-found forever and blocks every later sync. See the
+    # note in examples/wave-gating/gate.yaml.
     - id: migration
       jobComplete:
         name: db-migrate

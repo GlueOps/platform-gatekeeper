@@ -1,22 +1,29 @@
-# Platform setup, applied once per Argo CD instance. Merge this into the existing
-# argocd-cm ConfigMap (do not replace it -- argocd-cm holds other settings).
+# Argo CD health check for Gate resources. Platform setup, applied once per Argo CD
+# instance.
 #
-# This is not optional polish. Argo CD has no built-in health assessment for a
-# Gate, and a resource with no health check is *skipped* in the Application health
-# rollup -- the wave task is marked succeeded immediately and the next wave
-# proceeds ungated. Without this script, Gates do nothing.
+# APPLY IT WITH `kubectl patch`, NOT `kubectl apply`:
+#
+#   kubectl patch configmap argocd-cm -n argocd --type merge \
+#     --patch-file examples/argocd-health-check.yaml
+#
+# This file is deliberately a patch fragment rather than a full ConfigMap. A
+# complete one-key argocd-cm manifest is dangerous: Argo CD installs with
+# client-side apply, so `kubectl apply` would three-way-merge and DELETE every other
+# key in the live argocd-cm (url, timeout.reconciliation, resource.exclusions, …) —
+# after which Argo CD sees argocd-cm OutOfSync and selfHeals it back, silently
+# removing this health check and un-gating every Gate in the cluster.
+#
+# If argocd-cm is managed by Helm or GitOps, add the key there instead (for the
+# argo-cd chart that's `configs.cm`), not with the command above.
+#
+# This is not optional polish: Argo CD has no built-in health assessment for a Gate,
+# and a resource with no health check is *skipped* in the Application health rollup —
+# the wave task is marked succeeded immediately and the next wave proceeds ungated.
+# Without this script, Gates do nothing.
 #
 # Editing argocd-cm needs no restart, but it does trigger a full re-list, and a
-# syntax error in the script yields health Unknown, which the sync loop silently
-# ignores while the wave hangs. Test changes against a real Gate object first.
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: argocd-cm
-  namespace: argocd
-  labels:
-    app.kubernetes.io/name: argocd-cm
-    app.kubernetes.io/part-of: argocd
+# syntax error here yields health Unknown, which the sync loop silently ignores while
+# the wave hangs. Test changes against a real Gate object first.
 data:
   resource.customizations.health.platform.glueops.dev_Gate: |
     hs = {}
@@ -40,9 +47,9 @@ data:
           hs.status = "Healthy"
           return hs
         end
-        -- Terminal means the dependency cannot become ready without a change (a
-        -- failed Job, a Degraded Application, a stalled HelmRelease). Degraded
-        -- fails the sync operation promptly instead of waiting out the timeout.
+        -- Terminal means the upstream controller has declared it stopped trying (a
+        -- failed Job, a stalled HelmRelease). Degraded fails the sync operation
+        -- promptly instead of waiting out --sync-timeout.
         if c.reason == "Terminal" then
           hs.status = "Degraded"
           return hs

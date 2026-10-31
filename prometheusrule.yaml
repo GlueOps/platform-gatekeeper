@@ -1,12 +1,30 @@
 # Optional, and separate from deploy.yaml so a cluster without the Prometheus
-# Operator can still apply the rest. Requires a scrape config or ServiceMonitor
-# pointing at the gatekeeper Service's /metrics.
+# Operator can still apply the rest.
 #
-# This single alert is the whole staleness mitigation. Gatekeeper publishes Gate
+# These alerts are the whole staleness mitigation. Gatekeeper publishes Gate
 # readiness rather than answering requests, so a gatekeeper that is down or wedged
-# leaves Gates showing their last known state. Argo CD and `kubectl wait` both read
-# that state without being able to tell how old it is, so a rollout gated on an
-# already-Ready Gate can proceed on stale information until someone acts on this.
+# leaves Gates showing their last known state. Argo CD reads that state without
+# being able to tell how old it is, so a rollout gated on an already-Ready Gate can
+# proceed on stale information until someone acts on these.
+#
+# TWO THINGS MUST LINE UP, or the mitigation is silently absent:
+#
+#  1. `job="glueops-core-gatekeeper"` below must match the label your scrape config
+#     produces. servicemonitor.yaml yields exactly this (the Prometheus Operator
+#     defaults `job` to the Service name). If you scrape via pod annotations or a
+#     hand-written job instead, fix the label here — otherwise `absent()` is true
+#     forever on a healthy cluster, the alert fires immediately, gets silenced, and
+#     takes the arms that do work with it.
+#  2. `metadata.labels` must satisfy your Prometheus's `ruleSelector`.
+#     kube-prometheus-stack defaults to `ruleSelector: {release: <releaseName>}`, so
+#     add that label or the rule is accepted by the apiserver, shows up in
+#     `kubectl get prometheusrule`, and is never loaded.
+#
+# Verify after installing, rather than assuming:
+#   promtool check rules prometheusrule.yaml
+#   # then, in Prometheus:
+#   up{job="glueops-core-gatekeeper"}
+#   prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*gatekeeper.*"}
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -14,24 +32,68 @@ metadata:
   namespace: glueops-core-gatekeeper
   labels:
     app.kubernetes.io/name: glueops-core-gatekeeper
+    # release: kube-prometheus-stack   # uncomment to match a default ruleSelector
 spec:
   groups:
     - name: glueops-core-gatekeeper
       rules:
+        # Gatekeeper is not publishing fresh readiness. Every arm is wrapped in
+        # max() so they share one empty labelset: with differing labelsets Prometheus
+        # discards the pending state when the firing arm changes and restarts `for`,
+        # which delays a wedged-then-restarted pod by the full period again.
+        #
+        # The arms, and why each is needed:
+        #   - stale gauge: a live pod whose sweep is wedged or failing.
+        #   - up == 0: a pod that exists but cannot be scraped (CrashLoopBackOff,
+        #     OOMKilled, wedged listener). This arm is essential -- `absent()` does
+        #     NOT cover it, because `up` is a present series with value 0, and the
+        #     failed scrape stale-marks the gauge so the first arm goes empty too.
+        #   - absent: the target has left service discovery entirely.
+        #
+        # 300s rather than something tighter because Gates are evaluated serially
+        # with a 10s per-Gate ceiling, so a cluster with many Gates and unresponsive
+        # dependencies can legitimately take minutes. Raise it if you run far more
+        # Gates than that, and use gatekeeper_sweep_duration_seconds to tell a slow
+        # sweep from a wedged one.
         - alert: GatekeeperNotReconciling
-          # Covers both failure shapes: a dead pod (absent) and a live pod whose
-          # sweep is wedged or failing (timestamp stops advancing).
           expr: >-
-            time() - gatekeeper_last_successful_sweep_timestamp_seconds > 180
-            or absent(up{job="glueops-core-gatekeeper"})
-          for: 5m
+            max(time() - gatekeeper_last_successful_sweep_timestamp_seconds) > 300
+            or max(up{job="glueops-core-gatekeeper"}) == 0
+            or max(absent(up{job="glueops-core-gatekeeper"})) > 0
+          for: 2m
           labels:
             severity: warning
           annotations:
-            summary: Gatekeeper is not reconciling Gate status
+            summary: Gatekeeper is not publishing Gate readiness
             description: >-
               Gate readiness is stale, so deployments gated on an already-Ready Gate
               may proceed without their dependencies being verified. Check the
-              gatekeeper Deployment in glueops-core-gatekeeper, then confirm Gates
-              are being updated with `kubectl get gates -A`. An Argo CD sync stuck
-              waiting on a gate can be released with `argocd app terminate-op <app>`.
+              gatekeeper Deployment in glueops-core-gatekeeper, then confirm sweeps
+              are completing with
+              `kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper --tail=20 | grep sweep:`
+              (note that `kubectl get gates` will NOT show this: LAST-TRANSITION is
+              deliberately inherited, so a Gate that has been Ready for days looks
+              identical whether it was evaluated seconds or hours ago). Once
+              recovered, review which gated Applications synced during the window.
+              An Argo CD sync stuck waiting on a gate is released with
+              `argocd app terminate-op <app>`.
+
+        # A live gatekeeper that cannot reach a verdict is a different failure: the
+        # sweeps succeed, so the alert above stays quiet, but no Gate carries a
+        # usable answer and every gated rollout waits. Separate rule so it can be
+        # tuned independently -- a single Gate going Unknown for one sweep is a
+        # normal transient, which is why this is patient.
+        - alert: GatekeeperGatesUnevaluated
+          expr: max(gatekeeper_gates_unevaluated) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Gatekeeper cannot evaluate some Gates
+            description: >-
+              One or more Gates have been stuck with Ready=Unknown. Gated rollouts
+              are waiting rather than proceeding, so this blocks deploys rather than
+              risking them. Find the affected Gates with
+              `kubectl get gates -A | grep Unknown` and read `.status.results` for
+              the reason; common causes are gatekeeper's ClusterRole missing a kind
+              and the Kubernetes API rejecting its reads.
