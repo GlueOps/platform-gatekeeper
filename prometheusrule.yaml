@@ -1,0 +1,37 @@
+# Optional, and separate from deploy.yaml so a cluster without the Prometheus
+# Operator can still apply the rest. Requires a scrape config or ServiceMonitor
+# pointing at the gatekeeper Service's /metrics.
+#
+# This single alert is the whole staleness mitigation. Gatekeeper publishes Gate
+# readiness rather than answering requests, so a gatekeeper that is down or wedged
+# leaves Gates showing their last known state. Argo CD and `kubectl wait` both read
+# that state without being able to tell how old it is, so a rollout gated on an
+# already-Ready Gate can proceed on stale information until someone acts on this.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+spec:
+  groups:
+    - name: glueops-core-gatekeeper
+      rules:
+        - alert: GatekeeperNotReconciling
+          # Covers both failure shapes: a dead pod (absent) and a live pod whose
+          # sweep is wedged or failing (timestamp stops advancing).
+          expr: >-
+            time() - gatekeeper_last_successful_sweep_timestamp_seconds > 180
+            or absent(up{job="glueops-core-gatekeeper"})
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: Gatekeeper is not reconciling Gate status
+            description: >-
+              Gate readiness is stale, so deployments gated on an already-Ready Gate
+              may proceed without their dependencies being verified. Check the
+              gatekeeper Deployment in glueops-core-gatekeeper, then confirm Gates
+              are being updated with `kubectl get gates -A`. An Argo CD sync stuck
+              waiting on a gate can be released with `argocd app terminate-op <app>`.

@@ -3,21 +3,23 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
+	"math/rand"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 	appsv1 "k8s.io/api/apps/v1"
-	authv1 "k8s.io/api/authentication/v1"
-	authzv1 "k8s.io/api/authorization/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -33,6 +35,21 @@ const (
 	modeCustomer = "customer"
 	modePlatform = "platform"
 	defaultPort  = "8080"
+
+	conditionReady = "Ready"
+
+	// Condition reasons, in the precedence order summarize applies.
+	reasonInvalidSpec          = "InvalidSpec"
+	reasonPolicyViolation      = "PolicyViolation"
+	reasonReadForbidden        = "ReadForbidden"
+	reasonTerminal             = "Terminal"
+	reasonEvaluationFailed     = "EvaluationFailed"
+	reasonDependenciesNotReady = "DependenciesNotReady"
+	reasonReady                = "Ready"
+
+	defaultReconcileInterval = 30 * time.Second
+	perGateTimeout           = 20 * time.Second
+	maxMessageLen            = 1024
 )
 
 type Server struct {
@@ -45,27 +62,20 @@ type Server struct {
 	// platform-mode cross-namespace allowlist
 	platformAllowedNS       map[string]bool
 	platformAllowedPrefixes []string
-}
 
-type Caller struct {
-	User   string
-	Groups []string
-	Extra  map[string]authv1.ExtraValue
-	NS     string // derived from user: system:serviceaccount:<ns>:<name>
+	reconcileInterval time.Duration
+
+	// lastSweep holds the unix time of the last fully successful sweep. It is the
+	// only mutable field: written by the reconcile loop, read by /metrics.
+	lastSweep atomic.Int64
 }
 
 type EvalResult struct {
-	ID      string `json:"id"`
-	Ready   bool   `json:"ready"`
-	Message string `json:"message,omitempty"`
-}
-
-type EvalResponse struct {
-	Gate      string       `json:"gate"`
-	Namespace string       `json:"namespace"` // the Gate namespace (not necessarily caller namespace in platform mode)
-	Ready     bool         `json:"ready"`
-	Mode      string       `json:"mode"`
-	Results   []EvalResult `json:"results"`
+	ID       string `json:"id"`
+	Ready    bool   `json:"ready"`
+	Reason   string `json:"reason,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Terminal bool   `json:"terminal,omitempty"`
 }
 
 func main() {
@@ -85,181 +95,174 @@ func main() {
 		log.Fatalf("dynamic client: %v", err)
 	}
 
-	gvr := schema.GroupVersionResource{
-		Group:    envOr("GATEKEEPER_GATE_GROUP", "platform.glueops.dev"),
-		Version:  envOr("GATEKEEPER_GATE_VERSION", "v1alpha1"),
-		Resource: envOr("GATEKEEPER_GATE_RESOURCE", "gates"),
+	s := &Server{
+		kube: kube,
+		dyn:  dyn,
+		gateGVR: schema.GroupVersionResource{
+			Group:    envOr("GATEKEEPER_GATE_GROUP", "platform.glueops.dev"),
+			Version:  envOr("GATEKEEPER_GATE_VERSION", "v1alpha2"),
+			Resource: envOr("GATEKEEPER_GATE_RESOURCE", "gates"),
+		},
+		// Empty by default: an operator that forgets these env vars gets no
+		// cross-namespace access rather than a silently working allowlist.
+		platformAllowedNS:       parseCSVSet(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES")),
+		platformAllowedPrefixes: parseCSVList(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES")),
+		reconcileInterval:       reconcileInterval(),
 	}
 
-	allowed := parseCSVSet(envOr("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES", "glueops-core,nonprod"))
-	prefixes := parseCSVList(envOr("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES", "glueops-core-"))
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	s := &Server{
-		kube:                    kube,
-		dyn:                     dyn,
-		gateGVR:                 gvr,
-		platformAllowedNS:       allowed,
-		platformAllowedPrefixes: prefixes,
+	if s.reconcileInterval > 0 {
+		go s.reconcileLoop(ctx)
+	} else {
+		log.Printf("reconcile loop disabled (GATEKEEPER_RECONCILE_INTERVAL=0)")
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/check", s.handleCheck(false))
-	mux.HandleFunc("/explain", s.handleCheck(true))
-	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(200) })
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/metrics", s.handleMetrics)
 
-	addr := ":" + envOr("PORT", defaultPort)
-	log.Printf("gatekeeper listening on %s", addr)
-	log.Fatal(http.ListenAndServe(addr, mux))
+	srv := &http.Server{Addr: ":" + envOr("PORT", defaultPort), Handler: mux}
+	go func() {
+		<-ctx.Done()
+		shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(shutdown)
+	}()
+
+	log.Printf("gatekeeper listening on %s, reconciling every %s", srv.Addr, s.reconcileInterval)
+	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 func loadKubeConfig() (*rest.Config, error) {
-	if cfg, err := rest.InClusterConfig(); err == nil {
-		return cfg, nil
-	}
-	return clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
-}
-
-func (s *Server) handleCheck(always200 bool) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-
-		ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
-		defer cancel()
-
-		caller, err := s.authenticate(ctx, r)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusUnauthorized)
-			return
-		}
-
-		gateName := strings.TrimSpace(r.URL.Query().Get("gate"))
-		if gateName == "" {
-			http.Error(w, "missing ?gate=", http.StatusBadRequest)
-			return
-		}
-
-		// Determine namespace mode from the caller namespace label
-		mode, err := s.namespaceMode(ctx, caller.NS)
-		if err != nil {
-			http.Error(w, fmt.Sprintf("namespace mode lookup: %v", err), http.StatusBadGateway)
-			return
-		}
-
-		// Gate namespace can be overridden in platform mode via ?ns=
-		gateNS := strings.TrimSpace(r.URL.Query().Get("ns"))
-		if gateNS == "" {
-			gateNS = caller.NS
-		}
-
-		// Policy for Gate lookup namespace
-		if mode == modeCustomer && gateNS != caller.NS {
-			http.Error(w, "cross-namespace gate lookup not allowed in customer mode", http.StatusForbidden)
-			return
-		}
-		if mode == modePlatform && gateNS != caller.NS && !s.platformNSAllowed(gateNS) {
-			http.Error(w, fmt.Sprintf("gate namespace not allowed in platform mode (ns=%s)", gateNS), http.StatusForbidden)
-			return
-		}
-
-		// Delegated authz: caller must be allowed to GET the Gate object in gateNS
-		if err := s.requireSAR(ctx, caller, gateNS, s.gateGVR.Group, s.gateGVR.Resource, "get", gateName); err != nil {
-			http.Error(w, err.Error(), http.StatusForbidden)
-			return
-		}
-
-		// Load Gate in gateNS
-		gateObj, err := s.dyn.Resource(s.gateGVR).Namespace(gateNS).Get(ctx, gateName, metav1.GetOptions{})
-		if err != nil {
-			http.Error(w, fmt.Sprintf("gate not found: %v", err), http.StatusNotFound)
-			return
-		}
-
-		results, ready, evalErr := s.evaluateGate(ctx, caller, mode, gateNS, gateObj)
-
-		resp := EvalResponse{
-			Gate:      gateName,
-			Namespace: gateNS,
-			Ready:     ready,
-			Mode:      mode,
-			Results:   results,
-		}
-
-		// Update Gate.status best-effort (does not change response)
-		if err := s.updateGateStatus(ctx, gateNS, gateObj, ready, results); err != nil {
-			log.Printf("warning: failed to update gate status %s/%s: %v", gateNS, gateName, err)
-		}
-
-		// Return
-		if evalErr != nil {
-			// policy/authz/spec errors should be clear to operator
-			http.Error(w, evalErr.Error(), http.StatusForbidden)
-			return
-		}
-
-		status := http.StatusOK
-		if !always200 && !ready {
-			status = http.StatusConflict
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(status)
-		enc := json.NewEncoder(w)
-		enc.SetIndent("", "  ")
-		if err := enc.Encode(resp); err != nil {
-			log.Printf("warning: failed to encode response: %v", err)
-		}
-	}
-}
-
-func (s *Server) authenticate(ctx context.Context, r *http.Request) (*Caller, error) {
-	auth := strings.TrimSpace(r.Header.Get("Authorization"))
-	parts := strings.SplitN(auth, " ", 2)
-	if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-		return nil, errors.New("missing bearer token")
-	}
-	token := strings.TrimSpace(parts[1])
-	if token == "" {
-		return nil, errors.New("missing bearer token")
-	}
-
-	tr := &authv1.TokenReview{Spec: authv1.TokenReviewSpec{Token: token}}
-	out, err := s.kube.AuthenticationV1().TokenReviews().Create(ctx, tr, metav1.CreateOptions{})
+	cfg, err := rest.InClusterConfig()
 	if err != nil {
-		return nil, fmt.Errorf("tokenreview failed: %w", err)
+		cfg, err = clientcmd.BuildConfigFromFlags("", os.Getenv("KUBECONFIG"))
+		if err != nil {
+			return nil, err
+		}
 	}
-	if !out.Status.Authenticated {
-		return nil, errors.New("token not authenticated")
-	}
-
-	user := out.Status.User.Username
-	ns, err := namespaceFromSAUser(user)
-	if err != nil {
-		return nil, fmt.Errorf("unsupported user format: %v", err)
-	}
-
-	return &Caller{
-		User:   user,
-		Groups: out.Status.User.Groups,
-		Extra:  out.Status.User.Extra,
-		NS:     ns,
-	}, nil
+	// client-go defaults to 5 QPS / burst 10, which throttles a sweep that reads
+	// every check of every Gate and makes sweep duration scale badly.
+	cfg.QPS = 50
+	cfg.Burst = 100
+	return cfg, nil
 }
 
-func namespaceFromSAUser(username string) (string, error) {
-	// expected: system:serviceaccount:<ns>:<sa>
-	const prefix = "system:serviceaccount:"
-	if !strings.HasPrefix(username, prefix) {
-		return "", errors.New("not a serviceaccount user")
+func reconcileInterval() time.Duration {
+	raw := strings.TrimSpace(os.Getenv("GATEKEEPER_RECONCILE_INTERVAL"))
+	if raw == "" {
+		return defaultReconcileInterval
 	}
-	remaining := strings.TrimPrefix(username, prefix)
-	parts := strings.Split(remaining, ":")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", errors.New("bad serviceaccount username")
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		log.Printf("warning: bad GATEKEEPER_RECONCILE_INTERVAL %q, using %s: %v", raw, defaultReconcileInterval, err)
+		return defaultReconcileInterval
 	}
-	return parts[0], nil
+	return d
+}
+
+// --- metrics
+
+func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	fmt.Fprint(w, "# HELP gatekeeper_last_successful_sweep_timestamp_seconds Unix time of the last sweep in which every Gate was evaluated and its status written.\n")
+	fmt.Fprint(w, "# TYPE gatekeeper_last_successful_sweep_timestamp_seconds gauge\n")
+	fmt.Fprintf(w, "gatekeeper_last_successful_sweep_timestamp_seconds %d\n", s.lastSweep.Load())
+}
+
+// --- reconcile
+
+func (s *Server) reconcileLoop(ctx context.Context) {
+	for {
+		s.reconcileOnce(ctx)
+
+		// Wait after the sweep rather than between sweep starts, so a slow sweep
+		// can never overlap the next one.
+		delay := s.reconcileInterval
+		if jitter := int64(s.reconcileInterval / 4); jitter > 0 {
+			delay += time.Duration(rand.Int63n(jitter))
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(delay):
+		}
+	}
+}
+
+// reconcileOnce evaluates every Gate in the cluster and records the sweep time if
+// all of them were written successfully.
+func (s *Server) reconcileOnce(ctx context.Context) {
+	list, err := s.dyn.Resource(s.gateGVR).Namespace("").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		log.Printf("sweep: list gates: %v", err)
+		return
+	}
+
+	// Many Gates share a namespace, so resolve each namespace's mode once per sweep.
+	modes := map[string]string{}
+	failed := 0
+
+	for i := range list.Items {
+		gate := &list.Items[i]
+		if err := s.reconcileGate(ctx, gate, modes); err != nil {
+			// A Gate deleted mid-sweep is not a failure.
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			failed++
+			log.Printf("sweep: gate %s/%s: %v", gate.GetNamespace(), gate.GetName(), err)
+		}
+	}
+
+	if failed == 0 {
+		s.lastSweep.Store(time.Now().Unix())
+	}
+	log.Printf("sweep: %d gates, %d write failures", len(list.Items), failed)
+}
+
+func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructured, modes map[string]string) (err error) {
+	// One bad Gate must not take down the sweep.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic evaluating gate: %v", r)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(ctx, perGateTimeout)
+	defer cancel()
+
+	ns := gate.GetNamespace()
+	mode, cached := modes[ns]
+	if !cached {
+		resolved, modeErr := s.namespaceMode(ctx, ns)
+		if modeErr != nil {
+			// Policy is undecidable, so make no claim about readiness rather than
+			// defaulting to a mode and evaluating under the wrong rules.
+			return s.writeStatus(ctx, gate, metav1.ConditionUnknown, reasonEvaluationFailed,
+				fmt.Sprintf("namespace mode lookup failed: %v", modeErr), nil)
+		}
+		mode = resolved
+		modes[ns] = mode
+	}
+
+	results := s.evaluateGate(ctx, mode, ns, gate)
+
+	// Dropping per-caller SubjectAccessReview means the API server audit log
+	// attributes every read to gatekeeper's ServiceAccount; this is the only
+	// remaining record of which Gate caused which reads.
+	ids := make([]string, 0, len(results))
+	for _, r := range results {
+		ids = append(ids, r.ID)
+	}
+	log.Printf("evaluated gate %s/%s (mode=%s) checks=%s", ns, gate.GetName(), mode, strings.Join(ids, ","))
+
+	status, reason, message := summarize(results)
+	return s.writeStatus(ctx, gate, status, reason, message, results)
 }
 
 func (s *Server) namespaceMode(ctx context.Context, ns string) (string, error) {
@@ -267,8 +270,7 @@ func (s *Server) namespaceMode(ctx context.Context, ns string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	mode := strings.ToLower(strings.TrimSpace(obj.Labels[nsModeLabel]))
-	if mode == modePlatform {
+	if strings.ToLower(strings.TrimSpace(obj.Labels[nsModeLabel])) == modePlatform {
 		return modePlatform, nil
 	}
 	return modeCustomer, nil
@@ -286,52 +288,38 @@ func (s *Server) platformNSAllowed(ns string) bool {
 	return false
 }
 
-func (s *Server) evaluateGate(ctx context.Context, caller *Caller, mode, gateNS string, gate *unstructured.Unstructured) ([]EvalResult, bool, error) {
+// --- evaluation
+
+func (s *Server) evaluateGate(ctx context.Context, mode, gateNS string, gate *unstructured.Unstructured) []EvalResult {
 	checks, found, err := unstructured.NestedSlice(gate.Object, "spec", "checks")
 	if err != nil || !found {
-		return []EvalResult{{ID: "spec", Ready: false, Message: "missing spec.checks"}}, false, errors.New("invalid gate spec")
-	}
-
-	strict := true
-	if v, ok, _ := unstructured.NestedBool(gate.Object, "spec", "strict"); ok {
-		strict = v
+		return []EvalResult{{ID: "spec", Reason: reasonInvalidSpec, Message: "missing spec.checks"}}
 	}
 
 	results := make([]EvalResult, 0, len(checks))
-	allReady := true
-
 	for i, c := range checks {
 		checkMap, ok := c.(map[string]any)
 		if !ok {
 			results = append(results, EvalResult{
 				ID:      fmt.Sprintf("check-%d", i),
-				Ready:   false,
+				Reason:  reasonInvalidSpec,
 				Message: "check item is not an object",
 			})
-			allReady = false
-			if strict {
-				return results, false, errors.New("invalid check object")
-			}
 			continue
 		}
 
 		id := strOr(checkMap["id"], fmt.Sprintf("check-%d", i))
 
-		// Enforce exactly one check type set
 		if n := countCheckTypes(checkMap); n != 1 {
 			results = append(results, EvalResult{
 				ID:      id,
-				Ready:   false,
-				Message: fmt.Sprintf("invalid check: expected exactly 1 check type, got %d", n),
+				Reason:  reasonInvalidSpec,
+				Message: fmt.Sprintf("expected exactly 1 check type, got %d", n),
 			})
-			allReady = false
-			if strict {
-				return results, false, errors.New("invalid check: multiple or zero check types")
-			}
 			continue
 		}
 
-		// target namespace defaults to gateNS (NOT caller.NS) so central platform callers work
+		// A check's namespace defaults to the Gate's, not the caller's.
 		targetNS := gateNS
 		if nsRaw, ok := checkMap["namespace"]; ok {
 			if ns := strings.TrimSpace(fmt.Sprint(nsRaw)); ns != "" {
@@ -339,59 +327,76 @@ func (s *Server) evaluateGate(ctx context.Context, caller *Caller, mode, gateNS 
 			}
 		}
 
-		// policy: customer mode => same namespace only (both Gate and deps)
-		if mode == modeCustomer && targetNS != gateNS {
-			results = append(results, EvalResult{
-				ID:      id,
-				Ready:   false,
-				Message: fmt.Sprintf("cross-namespace checks not allowed in customer mode (target=%s)", targetNS),
-			})
-			allReady = false
-			if strict {
-				return results, false, errors.New("policy violation")
+		if targetNS != gateNS {
+			if mode != modePlatform {
+				results = append(results, EvalResult{
+					ID:      id,
+					Reason:  reasonPolicyViolation,
+					Message: fmt.Sprintf("cross-namespace checks not allowed in customer mode (target=%s)", targetNS),
+				})
+				continue
 			}
-			continue
+			if !s.platformNSAllowed(targetNS) {
+				results = append(results, EvalResult{
+					ID:      id,
+					Reason:  reasonPolicyViolation,
+					Message: fmt.Sprintf("target namespace not allowed in platform mode (target=%s)", targetNS),
+				})
+				continue
+			}
 		}
 
-		// policy: platform mode => allow deps in allowlist/prefix list
-		if mode == modePlatform && targetNS != gateNS && !s.platformNSAllowed(targetNS) {
-			results = append(results, EvalResult{
-				ID:      id,
-				Ready:   false,
-				Message: fmt.Sprintf("target namespace not allowed in platform mode (target=%s)", targetNS),
-			})
-			allReady = false
-			if strict {
-				return results, false, errors.New("policy violation")
-			}
-			continue
-		}
+		results = append(results, s.evalOne(ctx, targetNS, id, checkMap))
+	}
 
-		ready, msg, specErr, authErr := s.evalOne(ctx, caller, targetNS, checkMap)
-		if authErr != nil {
-			results = append(results, EvalResult{ID: id, Ready: false, Message: authErr.Error()})
-			allReady = false
-			if strict {
-				return results, false, authErr
-			}
-			continue
-		}
-		if specErr != nil {
-			results = append(results, EvalResult{ID: id, Ready: false, Message: specErr.Error()})
-			allReady = false
-			if strict {
-				return results, false, specErr
-			}
-			continue
-		}
+	return results
+}
 
-		results = append(results, EvalResult{ID: id, Ready: ready, Message: msg})
-		if !ready {
-			allReady = false
+// summarize rolls per-check results up into the Gate's Ready condition. It is the
+// only place the condition's status, reason and message are derived.
+//
+// Reasons are applied in a fixed precedence so the condition names the most
+// actionable problem rather than whichever check happened to sort first: a spec
+// error the author can fix outranks a policy violation, which outranks
+// gatekeeper's own missing RBAC, which outranks a dependency that will never
+// become ready, which outranks a dependency we simply could not evaluate.
+func summarize(results []EvalResult) (metav1.ConditionStatus, string, string) {
+	if len(results) == 0 {
+		return metav1.ConditionFalse, reasonInvalidSpec, "gate has no checks"
+	}
+
+	for _, reason := range []string{
+		reasonInvalidSpec,
+		reasonPolicyViolation,
+		reasonReadForbidden,
+		reasonTerminal,
+		reasonEvaluationFailed,
+		reasonDependenciesNotReady,
+	} {
+		for _, r := range results {
+			if resultReason(r) != reason {
+				continue
+			}
+			// "Could not evaluate" is not a claim that the dependency is unready.
+			status := metav1.ConditionFalse
+			if reason == reasonEvaluationFailed {
+				status = metav1.ConditionUnknown
+			}
+			return status, reason, truncate(fmt.Sprintf("%s: %s", r.ID, r.Message))
 		}
 	}
 
-	return results, allReady, nil
+	return metav1.ConditionTrue, reasonReady, fmt.Sprintf("%d checks passed", len(results))
+}
+
+func resultReason(r EvalResult) string {
+	if r.Ready {
+		return reasonReady
+	}
+	if r.Reason != "" {
+		return r.Reason
+	}
+	return reasonDependenciesNotReady
 }
 
 func countCheckTypes(m map[string]any) int {
@@ -413,252 +418,271 @@ func countCheckTypes(m map[string]any) int {
 	return n
 }
 
-func (s *Server) evalOne(ctx context.Context, caller *Caller, ns string, check map[string]any) (ready bool, msg string, specErr error, authErr error) {
-	// Determine which check type is set
-
+func (s *Server) evalOne(ctx context.Context, ns, id string, check map[string]any) EvalResult {
 	if block, ok := check["deploymentAvailable"].(map[string]any); ok {
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("deploymentAvailable.name required"), nil
+			return specErr(id, "deploymentAvailable.name required")
 		}
 		minAvail := int64(numOr(block["minAvailableReplicas"], 1))
 
-		if err := s.requireSAR(ctx, caller, ns, "apps", "deployments", "get", name); err != nil {
-			return false, "", nil, err
-		}
-
 		d, err := s.kube.AppsV1().Deployments(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("deployment get failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("deployment %s/%s", ns, name), "apps/deployments", err)
 		}
-		return deploymentReady(d, minAvail)
+		ready, msg := deploymentReady(d, minAvail)
+		return plain(id, ready, msg)
 	}
 
 	if block, ok := check["statefulSetReady"].(map[string]any); ok {
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("statefulSetReady.name required"), nil
+			return specErr(id, "statefulSetReady.name required")
 		}
 		minReady := int64(numOr(block["minReadyReplicas"], 1))
 		reqUpd := boolOr(block["requireUpdatedRevision"], true)
 
-		if err := s.requireSAR(ctx, caller, ns, "apps", "statefulsets", "get", name); err != nil {
-			return false, "", nil, err
-		}
-
 		sts, err := s.kube.AppsV1().StatefulSets(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("statefulset get failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("statefulset %s/%s", ns, name), "apps/statefulsets", err)
 		}
-		return statefulSetReady(sts, minReady, reqUpd)
+		ready, msg := statefulSetReady(sts, minReady, reqUpd)
+		return plain(id, ready, msg)
 	}
 
 	if block, ok := check["jobComplete"].(map[string]any); ok {
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("jobComplete.name required"), nil
-		}
-
-		if err := s.requireSAR(ctx, caller, ns, "batch", "jobs", "get", name); err != nil {
-			return false, "", nil, err
+			return specErr(id, "jobComplete.name required")
 		}
 
 		j, err := s.kube.BatchV1().Jobs(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("job get failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("job %s/%s", ns, name), "batch/jobs", err)
 		}
-		return jobComplete(j)
+		ready, msg, terminal := jobComplete(j)
+		return withTerminal(id, ready, msg, terminal)
 	}
 
 	if block, ok := check["serviceReadyEndpoints"].(map[string]any); ok {
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("serviceReadyEndpoints.name required"), nil
+			return specErr(id, "serviceReadyEndpoints.name required")
 		}
 		minReady := int64(numOr(block["minReadyAddresses"], 1))
 
-		if err := s.requireSAR(ctx, caller, ns, "", "services", "get", name); err != nil {
-			return false, "", nil, err
+		if _, err := s.kube.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{}); err != nil {
+			return readErr(id, fmt.Sprintf("service %s/%s", ns, name), "services", err)
 		}
-		if err := s.requireSAR(ctx, caller, ns, "discovery.k8s.io", "endpointslices", "list", ""); err != nil {
-			return false, "", nil, err
-		}
-
-		_, err := s.kube.CoreV1().Services(ns).Get(ctx, name, metav1.GetOptions{})
-		if err != nil {
-			return false, fmt.Sprintf("service get failed: %v", err), nil, nil
-		}
-
 		readyAddrs, err := countReadyAddressesForService(ctx, s.kube, ns, name)
 		if err != nil {
-			return false, fmt.Sprintf("endpointslices failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("endpointslices for service %s/%s", ns, name), "discovery.k8s.io/endpointslices", err)
 		}
 		if readyAddrs >= minReady {
-			return true, fmt.Sprintf("ready addresses %d >= %d", readyAddrs, minReady), nil, nil
+			return plain(id, true, fmt.Sprintf("ready addresses %d >= %d", readyAddrs, minReady))
 		}
-		return false, fmt.Sprintf("ready addresses %d < %d", readyAddrs, minReady), nil, nil
+		return plain(id, false, fmt.Sprintf("ready addresses %d < %d", readyAddrs, minReady))
 	}
 
 	if block, ok := check["podLabelReady"].(map[string]any); ok {
 		selector := strOr(block["selector"], "")
 		if selector == "" {
-			return false, "", errors.New("podLabelReady.selector required"), nil
+			return specErr(id, "podLabelReady.selector required")
 		}
 		minReady := int64(numOr(block["minReadyPods"], 1))
 
-		if err := s.requireSAR(ctx, caller, ns, "", "pods", "list", ""); err != nil {
-			return false, "", nil, err
-		}
-
 		pods, err := s.kube.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
 		if err != nil {
-			return false, fmt.Sprintf("pods list failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("pods in %s matching %q", ns, selector), "pods", err)
 		}
 		readyCount := int64(0)
-		for _, p := range pods.Items {
-			if podReady(&p) {
+		for i := range pods.Items {
+			if podReady(&pods.Items[i]) {
 				readyCount++
 			}
 		}
 		if readyCount >= minReady {
-			return true, fmt.Sprintf("ready pods %d >= %d", readyCount, minReady), nil, nil
+			return plain(id, true, fmt.Sprintf("ready pods %d >= %d", readyCount, minReady))
 		}
-		return false, fmt.Sprintf("ready pods %d < %d", readyCount, minReady), nil, nil
+		return plain(id, false, fmt.Sprintf("ready pods %d < %d", readyCount, minReady))
 	}
 
 	if raw, exists := check["argoApplicationHealthy"]; exists {
 		block, ok := raw.(map[string]any)
 		if !ok {
-			return false, "", errors.New("argoApplicationHealthy must be an object"), nil
+			return specErr(id, "argoApplicationHealthy must be an object")
 		}
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("argoApplicationHealthy.name required"), nil
+			return specErr(id, "argoApplicationHealthy.name required")
 		}
 		requireSynced := boolOr(block["requireSynced"], true)
 		requireHealthy := boolOr(block["requireHealthy"], true)
 
-		argoGVR := schema.GroupVersionResource{
-			Group:    "argoproj.io",
-			Version:  "v1alpha1",
-			Resource: "applications",
-		}
-
-		if err := s.requireSAR(ctx, caller, ns, argoGVR.Group, argoGVR.Resource, "get", name); err != nil {
-			return false, "", nil, err
-		}
-
-		app, err := s.dyn.Resource(argoGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		gvr := schema.GroupVersionResource{Group: "argoproj.io", Version: "v1alpha1", Resource: "applications"}
+		app, err := s.dyn.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("argo application get failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("argo application %s/%s", ns, name), "argoproj.io/applications", err)
 		}
-		return argoAppReady(app, requireSynced, requireHealthy)
+		ready, msg, terminal, upstreamErr := argoAppReady(app, requireSynced, requireHealthy)
+		if upstreamErr != nil {
+			// The Application's own status is malformed; that is not the Gate
+			// author's mistake, so it must not be reported as InvalidSpec.
+			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(upstreamErr.Error())}
+		}
+		return withTerminal(id, ready, msg, terminal)
 	}
 
 	if raw, exists := check["fluxHelmReleaseReady"]; exists {
 		block, ok := raw.(map[string]any)
 		if !ok {
-			return false, "", errors.New("fluxHelmReleaseReady must be an object"), nil
+			return specErr(id, "fluxHelmReleaseReady must be an object")
 		}
 		name := strOr(block["name"], "")
 		if name == "" {
-			return false, "", errors.New("fluxHelmReleaseReady.name required"), nil
+			return specErr(id, "fluxHelmReleaseReady.name required")
 		}
 		requireCurrentGeneration := boolOr(block["requireCurrentGeneration"], true)
 
-		hrGVR := schema.GroupVersionResource{
-			Group:    "helm.toolkit.fluxcd.io",
-			Version:  "v2",
-			Resource: "helmreleases",
-		}
-
-		if err := s.requireSAR(ctx, caller, ns, hrGVR.Group, hrGVR.Resource, "get", name); err != nil {
-			return false, "", nil, err
-		}
-
-		hr, err := s.dyn.Resource(hrGVR).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
+		gvr := schema.GroupVersionResource{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
+		hr, err := s.dyn.Resource(gvr).Namespace(ns).Get(ctx, name, metav1.GetOptions{})
 		if err != nil {
-			return false, fmt.Sprintf("flux helmrelease get failed: %v", err), nil, nil
+			return readErr(id, fmt.Sprintf("helmrelease %s/%s", ns, name), "helm.toolkit.fluxcd.io/helmreleases", err)
 		}
-		return fluxHelmReleaseReady(hr, requireCurrentGeneration)
+		ready, msg, terminal, upstreamErr := fluxHelmReleaseReady(hr, requireCurrentGeneration)
+		if upstreamErr != nil {
+			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(upstreamErr.Error())}
+		}
+		return withTerminal(id, ready, msg, terminal)
 	}
 
-	return false, "", errors.New("no recognized check type set"), nil
+	return specErr(id, "no recognized check type set")
+}
+
+// --- result constructors
+
+func plain(id string, ready bool, msg string) EvalResult {
+	r := EvalResult{ID: id, Ready: ready, Message: truncate(msg)}
+	if !ready {
+		r.Reason = reasonDependenciesNotReady
+	} else {
+		r.Reason = reasonReady
+	}
+	return r
+}
+
+func withTerminal(id string, ready bool, msg string, terminal bool) EvalResult {
+	r := plain(id, ready, msg)
+	if terminal {
+		r.Terminal = true
+		r.Reason = reasonTerminal
+	}
+	return r
+}
+
+func specErr(id, msg string) EvalResult {
+	return EvalResult{ID: id, Reason: reasonInvalidSpec, Message: truncate(msg)}
+}
+
+// readErr classifies an API read failure. A missing dependency is a normal
+// not-ready; a forbidden read means gatekeeper's own ClusterRole is short, which
+// an operator must fix; anything else is indeterminate and must not be reported
+// as a definite answer, or a single API blip would flip a healthy Gate to False.
+func readErr(id, what, rule string, err error) EvalResult {
+	switch {
+	case apierrors.IsNotFound(err):
+		return EvalResult{ID: id, Reason: reasonDependenciesNotReady, Message: truncate(what + " not found")}
+	case apierrors.IsForbidden(err):
+		return EvalResult{
+			ID:      id,
+			Reason:  reasonReadForbidden,
+			Message: truncate(fmt.Sprintf("gatekeeper cannot read %s: grant %s in its ClusterRole", what, rule)),
+		}
+	default:
+		return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(fmt.Sprintf("%s read failed: %v", what, err))}
+	}
 }
 
 // --- readiness helpers
 
-func deploymentReady(d *appsv1.Deployment, minAvail int64) (bool, string, error, error) {
+func deploymentReady(d *appsv1.Deployment, minAvail int64) (bool, string) {
 	avail := int64(d.Status.AvailableReplicas)
 	if avail < minAvail {
-		return false, fmt.Sprintf("availableReplicas %d < %d", avail, minAvail), nil, nil
+		return false, fmt.Sprintf("availableReplicas %d < %d", avail, minAvail)
 	}
 	for _, c := range d.Status.Conditions {
 		if c.Type == appsv1.DeploymentAvailable && c.Status == corev1.ConditionTrue {
-			return true, "deployment Available=True", nil, nil
+			return true, "deployment Available=True"
 		}
 	}
-	return false, "deployment Available condition not True", nil, nil
+	return false, "deployment Available condition not True"
 }
 
-func statefulSetReady(sts *appsv1.StatefulSet, minReady int64, requireUpdated bool) (bool, string, error, error) {
+func statefulSetReady(sts *appsv1.StatefulSet, minReady int64, requireUpdated bool) (bool, string) {
 	ready := int64(sts.Status.ReadyReplicas)
 	if ready < minReady {
-		return false, fmt.Sprintf("readyReplicas %d < %d", ready, minReady), nil, nil
+		return false, fmt.Sprintf("readyReplicas %d < %d", ready, minReady)
 	}
 	if requireUpdated {
 		if sts.Status.UpdateRevision != "" && sts.Status.CurrentRevision != "" &&
 			sts.Status.UpdateRevision != sts.Status.CurrentRevision {
-			return false, fmt.Sprintf("revision not fully updated (current=%s update=%s)", sts.Status.CurrentRevision, sts.Status.UpdateRevision), nil, nil
+			return false, fmt.Sprintf("revision not fully updated (current=%s update=%s)", sts.Status.CurrentRevision, sts.Status.UpdateRevision)
 		}
 	}
-	return true, "statefulset ready", nil, nil
+	return true, "statefulset ready"
 }
 
-func jobComplete(j *batchv1.Job) (bool, string, error, error) {
+// jobComplete reports Failed=True as terminal: a failed Job will not become
+// complete on its own, so a poller that treats it as "not ready yet" burns its
+// whole timeout waiting for something that cannot happen.
+func jobComplete(j *batchv1.Job) (ready bool, msg string, terminal bool) {
 	for _, c := range j.Status.Conditions {
 		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
-			return true, "job Complete=True", nil, nil
+			return true, "job Complete=True", false
 		}
 		if c.Type == batchv1.JobFailed && c.Status == corev1.ConditionTrue {
 			if c.Message != "" {
-				return false, "job Failed=True: " + c.Message, nil, nil
+				return false, "job Failed=True: " + c.Message, true
 			}
-			return false, "job Failed=True", nil, nil
+			return false, "job Failed=True", true
 		}
 	}
-	return false, "job not complete yet", nil, nil
+	return false, "job not complete yet", false
 }
 
-func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (bool, string, error, error) {
+// argoAppReady evaluates an Argo CD Application's health and sync status. A
+// Degraded Application is terminal for the same reason a failed Job is: it will
+// not recover without a change, so waiting out the timeout achieves nothing.
+func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (ready bool, msg string, terminal bool, err error) {
 	if requireHealthy {
-		healthStatus, found, err := unstructured.NestedString(app.Object, "status", "health", "status")
-		if err != nil {
-			return false, "", fmt.Errorf("status.health.status has unexpected type: %w", err), nil
+		healthStatus, found, nestedErr := unstructured.NestedString(app.Object, "status", "health", "status")
+		if nestedErr != nil {
+			return false, "", false, fmt.Errorf("status.health.status has unexpected type: %w", nestedErr)
 		}
 		if !found {
-			return false, "status.health.status not present (application may still be initializing)", nil, nil
+			return false, "status.health.status not present (application may still be initializing)", false, nil
 		}
 		if healthStatus != "Healthy" {
-			return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), nil, nil
+			isTerminal := healthStatus == "Degraded" || healthStatus == "Missing"
+			return false, fmt.Sprintf("health status is %q, want Healthy", healthStatus), isTerminal, nil
 		}
 	}
 
 	if requireSynced {
-		syncStatus, found, err := unstructured.NestedString(app.Object, "status", "sync", "status")
-		if err != nil {
-			return false, "", fmt.Errorf("status.sync.status has unexpected type: %w", err), nil
+		syncStatus, found, nestedErr := unstructured.NestedString(app.Object, "status", "sync", "status")
+		if nestedErr != nil {
+			return false, "", false, fmt.Errorf("status.sync.status has unexpected type: %w", nestedErr)
 		}
 		if !found {
-			return false, "status.sync.status not present (application may still be initializing)", nil, nil
+			return false, "status.sync.status not present (application may still be initializing)", false, nil
 		}
 		if syncStatus != "Synced" {
-			return false, fmt.Sprintf("sync status is %q, want Synced", syncStatus), nil, nil
+			return false, fmt.Sprintf("sync status is %q, want Synced", syncStatus), false, nil
 		}
 	}
 
 	if !requireHealthy && !requireSynced {
-		return true, "no conditions required", nil, nil
+		return true, "no conditions required", false, nil
 	}
 
 	var parts []string
@@ -668,7 +692,7 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 	if requireSynced {
 		parts = append(parts, "Synced")
 	}
-	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), nil, nil
+	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), false, nil
 }
 
 // fluxHelmReleaseReady evaluates a Flux helm.toolkit.fluxcd.io/v2 HelmRelease.
@@ -689,35 +713,34 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 //
 //  2. Stalled. When helm-controller exhausts spec.upgrade.remediation.retries it sets
 //     Stalled=True and stops retrying until the spec, values or chart version change --
-//     an interval tick does not clear it. This is reported separately from a plain
-//     not-Ready because the two need different responses: not-Ready means keep polling,
-//     Stalled means a human has to run `flux reconcile helmrelease <name> --reset`. A
-//     poller that cannot tell them apart burns its whole timeout on a release that was
-//     never going to recover.
-func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneration bool) (bool, string, error, error) {
+//     an interval tick does not clear it. This is reported as terminal, because the two
+//     need different responses: not-Ready means keep polling, Stalled means a human has
+//     to run `flux reconcile helmrelease <name> --reset`. A poller that cannot tell them
+//     apart burns its whole timeout on a release that was never going to recover.
+func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneration bool) (ready bool, msg string, terminal bool, err error) {
 	if requireCurrentGeneration {
-		gen, genFound, err := unstructured.NestedInt64(hr.Object, "metadata", "generation")
-		if err != nil {
-			return false, "", fmt.Errorf("metadata.generation has unexpected type: %w", err), nil
+		gen, genFound, nestedErr := unstructured.NestedInt64(hr.Object, "metadata", "generation")
+		if nestedErr != nil {
+			return false, "", false, fmt.Errorf("metadata.generation has unexpected type: %w", nestedErr)
 		}
-		observed, obsFound, err := unstructured.NestedInt64(hr.Object, "status", "observedGeneration")
-		if err != nil {
-			return false, "", fmt.Errorf("status.observedGeneration has unexpected type: %w", err), nil
+		observed, obsFound, nestedErr := unstructured.NestedInt64(hr.Object, "status", "observedGeneration")
+		if nestedErr != nil {
+			return false, "", false, fmt.Errorf("status.observedGeneration has unexpected type: %w", nestedErr)
 		}
 		if !obsFound || observed < 0 {
-			return false, "status.observedGeneration not set (helmrelease not yet reconciled)", nil, nil
+			return false, "status.observedGeneration not set (helmrelease not yet reconciled)", false, nil
 		}
 		if genFound && observed < gen {
-			return false, fmt.Sprintf("status.observedGeneration %d behind metadata.generation %d (reconcile in progress)", observed, gen), nil, nil
+			return false, fmt.Sprintf("status.observedGeneration %d behind metadata.generation %d (reconcile in progress)", observed, gen), false, nil
 		}
 	}
 
-	conds, found, err := unstructured.NestedSlice(hr.Object, "status", "conditions")
-	if err != nil {
-		return false, "", fmt.Errorf("status.conditions has unexpected type: %w", err), nil
+	conds, found, nestedErr := unstructured.NestedSlice(hr.Object, "status", "conditions")
+	if nestedErr != nil {
+		return false, "", false, fmt.Errorf("status.conditions has unexpected type: %w", nestedErr)
 	}
 	if !found || len(conds) == 0 {
-		return false, "status.conditions not present (helmrelease may still be initializing)", nil, nil
+		return false, "status.conditions not present (helmrelease may still be initializing)", false, nil
 	}
 
 	condStatus := func(want string) (string, string, bool) {
@@ -735,24 +758,24 @@ func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneratio
 	}
 
 	// Stalled is checked before Ready so the message says why, not just "not ready".
-	if status, msg, ok := condStatus("Stalled"); ok && status == "True" {
-		if msg != "" {
-			return false, "helmrelease Stalled=True (will not retry until spec changes): " + msg, nil, nil
+	if status, stalledMsg, ok := condStatus("Stalled"); ok && status == "True" {
+		if stalledMsg != "" {
+			return false, "helmrelease Stalled=True (will not retry until spec changes): " + stalledMsg, true, nil
 		}
-		return false, "helmrelease Stalled=True (will not retry until spec changes)", nil, nil
+		return false, "helmrelease Stalled=True (will not retry until spec changes)", true, nil
 	}
 
-	status, msg, ok := condStatus("Ready")
+	status, readyMsg, ok := condStatus("Ready")
 	if !ok {
-		return false, "no Ready condition present (helmrelease may still be initializing)", nil, nil
+		return false, "no Ready condition present (helmrelease may still be initializing)", false, nil
 	}
 	if status != "True" {
-		if msg != "" {
-			return false, fmt.Sprintf("Ready=%s: %s", status, msg), nil, nil
+		if readyMsg != "" {
+			return false, fmt.Sprintf("Ready=%s: %s", status, readyMsg), false, nil
 		}
-		return false, fmt.Sprintf("Ready=%s", status), nil, nil
+		return false, fmt.Sprintf("Ready=%s", status), false, nil
 	}
-	return true, "helmrelease Ready=True", nil, nil
+	return true, "helmrelease Ready=True", false, nil
 }
 
 func podReady(p *corev1.Pod) bool {
@@ -771,8 +794,8 @@ func countReadyAddressesForService(ctx context.Context, kube kubernetes.Interfac
 		return 0, err
 	}
 	var ready int64
-	for _, es := range slices.Items {
-		ready += readyAddresses(&es)
+	for i := range slices.Items {
+		ready += readyAddresses(&slices.Items[i])
 	}
 	return ready, nil
 }
@@ -787,89 +810,76 @@ func readyAddresses(es *discoveryv1.EndpointSlice) int64 {
 	return n
 }
 
-// --- authz (delegated) helpers
+// --- status
 
-func (s *Server) requireSAR(ctx context.Context, caller *Caller, namespace, apiGroup, resource, verb, name string) error {
-	sar := &authzv1.SubjectAccessReview{
-		Spec: authzv1.SubjectAccessReviewSpec{
-			User:   caller.User,
-			Groups: caller.Groups,
-			Extra:  convertExtra(caller.Extra),
-			ResourceAttributes: &authzv1.ResourceAttributes{
-				Namespace: namespace,
-				Verb:      verb,
-				Group:     apiGroup,
-				Resource:  resource,
-				Name:      name,
-			},
+func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructured,
+	status metav1.ConditionStatus, reason, message string, results []EvalResult) error {
+
+	gen := gate.GetGeneration()
+	transition := metav1.Now().UTC().Format(time.RFC3339)
+	// metav1 semantics: lastTransitionTime marks the last time the status changed,
+	// not the last time it was observed. Inherit it unless the status flipped.
+	if prevStatus, prevTransition := readyConditionOf(gate); prevStatus == string(status) && prevTransition != "" {
+		transition = prevTransition
+	}
+
+	patch := map[string]any{
+		"status": map[string]any{
+			"observedGeneration": gen,
+			"conditions": []any{map[string]any{
+				"type":               conditionReady,
+				"status":             string(status),
+				"reason":             reason,
+				"message":            message,
+				"lastTransitionTime": transition,
+				"observedGeneration": gen,
+			}},
+			"results": resultsToUnstructured(results),
 		},
 	}
-	out, err := s.kube.AuthorizationV1().SubjectAccessReviews().Create(ctx, sar, metav1.CreateOptions{})
-	if err != nil {
-		return fmt.Errorf("subjectaccessreview failed: %w", err)
-	}
-	if !out.Status.Allowed {
-		reason := out.Status.Reason
-		if reason == "" {
-			reason = "not allowed"
-		}
-		group := apiGroup
-		if group == "" {
-			group = "core"
-		}
-		return fmt.Errorf("forbidden: %s %s (group=%s) name=%q ns=%q: %s", verb, resource, group, name, namespace, reason)
-	}
-	return nil
-}
 
-func convertExtra(extra map[string]authv1.ExtraValue) map[string]authzv1.ExtraValue {
-	if extra == nil {
-		return nil
-	}
-	out := make(map[string]authzv1.ExtraValue, len(extra))
-	for k, v := range extra {
-		out[k] = authzv1.ExtraValue(v)
-	}
-	return out
-}
-
-// --- Gate status update
-
-func (s *Server) updateGateStatus(ctx context.Context, ns string, gate *unstructured.Unstructured, ready bool, results []EvalResult) error {
-	now := time.Now().UTC().Format(time.RFC3339)
-
-	status := map[string]any{
-		"observedGeneration": gate.GetGeneration(),
-		"ready":              ready,
-		"lastEvaluatedTime":  now,
-		"results":            resultsToUnstructured(results),
-	}
-
-	patch := map[string]any{"status": status}
 	b, err := json.Marshal(patch)
 	if err != nil {
 		return fmt.Errorf("marshal status patch: %w", err)
 	}
 
-	_, err = s.dyn.Resource(s.gateGVR).Namespace(ns).Patch(
-		ctx,
-		gate.GetName(),
-		types.MergePatchType,
-		b,
-		metav1.PatchOptions{},
-		"status",
+	_, err = s.dyn.Resource(s.gateGVR).Namespace(gate.GetNamespace()).Patch(
+		ctx, gate.GetName(), types.MergePatchType, b, metav1.PatchOptions{}, "status",
 	)
 	return err
+}
+
+func readyConditionOf(gate *unstructured.Unstructured) (status, lastTransitionTime string) {
+	conds, found, err := unstructured.NestedSlice(gate.Object, "status", "conditions")
+	if err != nil || !found {
+		return "", ""
+	}
+	for _, raw := range conds {
+		c, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if strOr(c["type"], "") != conditionReady {
+			continue
+		}
+		return strOr(c["status"], ""), strOr(c["lastTransitionTime"], "")
+	}
+	return "", ""
 }
 
 func resultsToUnstructured(in []EvalResult) []any {
 	out := make([]any, 0, len(in))
 	for _, r := range in {
-		out = append(out, map[string]any{
+		item := map[string]any{
 			"id":      r.ID,
 			"ready":   r.Ready,
+			"reason":  r.Reason,
 			"message": r.Message,
-		})
+		}
+		if r.Terminal {
+			item["terminal"] = true
+		}
+		out = append(out, item)
 	}
 	return out
 }
@@ -881,6 +891,13 @@ func envOr(k, def string) string {
 		return v
 	}
 	return def
+}
+
+func truncate(s string) string {
+	if len(s) <= maxMessageLen {
+		return s
+	}
+	return s[:maxMessageLen-3] + "..."
 }
 
 func parseCSVSet(s string) map[string]bool {

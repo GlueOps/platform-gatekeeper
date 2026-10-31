@@ -1,153 +1,154 @@
 # AGENTS.md
 
-This repository contains **GlueOps Core Gatekeeper**, a small Go HTTP service that evaluates Kubernetes dependency “gates” defined by a `Gate` CRD. This file is intended to help AI coding assistants understand the system, constraints, and expected workflows.
+Guidance for AI coding assistants working in this repository.
 
----
+## What this is
 
-## Project summary
+**GlueOps Core Gatekeeper** — a small Kubernetes controller that evaluates `Gate`
+custom resources (`platform.glueops.dev/v1alpha2`) and publishes dependency
+readiness to `Gate.status`. Argo CD reads that status as resource health, so a sync
+wave can hold a rollout until the dependencies are up.
 
-Gatekeeper exposes a minimal HTTP API used primarily by deployment tooling (e.g. Argo CD hook Jobs) to **block or allow progression** of a rollout based on Kubernetes resource readiness.
+It is a **controller, not a service**. There is no request API: nothing calls
+gatekeeper to ask a question. It lists Gates on a timer, evaluates each check, and
+writes a `Ready` condition plus a per-check breakdown. The only HTTP endpoints are
+`/healthz` (a plain process check for the kubelet) and `/metrics` (one gauge).
 
-Key properties:
+Gatekeeper reads dependencies with **its own** ServiceAccount. Callers have no
+credentials and need no RBAC.
 
-- **AuthN**: Kubernetes `TokenReview` of a bearer token (typically a ServiceAccount token).
-- **AuthZ**: Kubernetes `SubjectAccessReview` for each requested action (delegated authorization).
-- **Policy modes**: Determined by a namespace label:
-  - `gatekeeper.platform.glueops.dev/mode=customer|platform`
-- **Gate source of truth**: A namespaced `Gate` custom resource (`platform.glueops.dev/v1alpha1`).
-- **Checks**: Allowlisted resource checks:
-  - `deploymentAvailable` — Deployment Available condition + min replicas (`get` on `apps/deployments`)
-  - `statefulSetReady` — StatefulSet ready replicas + optional revision check (`get` on `apps/statefulsets`)
-  - `jobComplete` — Job Complete condition (`get` on `batch/jobs`)
-  - `serviceReadyEndpoints` — Service endpoint addresses via EndpointSlices (`get` on `services`, `list` on `discovery.k8s.io/endpointslices`)
-  - `podLabelReady` — Pod count by label selector (`list` on `pods`)
-  - `argoApplicationHealthy` — Argo CD Application health/sync status (`get` on `argoproj.io/applications`)
-  - `fluxHelmReleaseReady` — Flux HelmRelease Ready condition, generation currency, and Stalled (`get` on `helm.toolkit.fluxcd.io/helmreleases`)
-- **Expected client**: An Argo CD PreSync hook Job (or similar) that polls until 200 OK.
-- **RBAC model**: Gatekeeper only needs `get` per named resource and `list` for collections. No `list`/`watch` needed for named lookups. Caller SAs need matching RBAC for the specific check types used in their Gate.
+## Repo map
 
----
+| Path | What |
+| --- | --- |
+| `main.go` | all application code — reconcile loop, evaluation, readiness predicates, status writing |
+| `main_test.go` | unit tests for the predicates plus reconcile-level tests on fake clients |
+| `crd.yaml` | the `Gate` CRD, including the CEL rule enforcing exactly one check type |
+| `rbac.yaml` | ServiceAccount, ClusterRole, binding — **the ceiling on what any Gate can read** |
+| `deploy.yaml` | Deployment and Service |
+| `prometheusrule.yaml` | the single staleness alert (optional; needs the Prometheus Operator) |
+| `examples/wave-gating/` | the worked example a consumer copies |
+| `examples/argocd-health-check.yaml` | the Lua health check for `argocd-cm` — **required**, see Decisions |
 
-## Repository conventions
+## Build and test
 
-### Primary runtime
-- **Language**: Go
-- **Runtime**: Kubernetes (in-cluster), but should also run locally against a kubeconfig for development.
+Everything runs in Docker; don't install Go on the host.
 
-### API behavior conventions
-- `/healthz` → 200 OK, empty body
-- `/check` → returns:
-  - **200** when gate passes
-  - **409** when checks are not ready (retryable)
-  - **4xx** on invalid spec / policy violation / auth errors
-- `/explain` → returns 200 with JSON (even if not ready), useful for debugging
+```bash
+docker run --rm -v "$PWD":/w -w /w golang:1.26-alpine sh -c 'go build ./... && go vet ./... && go test ./...'
 
-### JSON responses
-- Always return `Content-Type: application/json` for successful JSON responses.
-- Plain-text errors are acceptable for now, but prefer structured JSON error bodies in future changes.
-
----
-
-## Kubernetes model
-
-### Gate CRD
-- Group/version: `platform.glueops.dev/v1alpha1`
-- Kind: `Gate`
-- Scope: Namespaced
-- Gate status is updated using the CRD status subresource (`gates/status`).
-
-**Important**: A check item must set **exactly one** check type. Assistants should enforce this in code.
-
-### Namespace policy modes
-Mode is determined from the **caller namespace** label:
-
-```yaml
-gatekeeper.platform.glueops.dev/mode: customer|platform
+# -race needs cgo, so use the Debian image for that
+docker run --rm -v "$PWD":/w -w /w golang:1.26 go test -race ./...
 ```
 
-### Expected behavior:
+End-to-end against a throwaway cluster:
 
-- customer mode
-  - Gate lookup must be within caller namespace
-  - dependency checks must remain within the Gate’s namespace
-- platform mode
-  - optional cross-namespace Gate lookup via ?ns=<namespace>
-  - optional cross-namespace dependency checks
-  - cross-namespace is restricted by allowlists (see env vars below)
+```bash
+k3d cluster create gatekeeper-test
+docker build -t platform-gatekeeper:dev . && k3d image import platform-gatekeeper:dev -c gatekeeper-test
+kubectl apply -f crd.yaml -f rbac.yaml -f deploy.yaml
+```
 
-### Platform allowlists
+## How evaluation is structured
 
-Platform mode uses allow rules based on:
-- exact namespace allowlist
-- prefix allowlist (e.g. glueops-core- matches glueops-core-*)
+- `reconcileOnce` lists Gates and calls `reconcileGate` per Gate (bounded by a
+  per-Gate timeout, with `recover()` so one bad Gate can't take down the sweep).
+- `evaluateGate` walks `spec.checks` and returns `[]EvalResult`. It enforces the
+  namespace policy before any read.
+- `evalOne` dispatches on check type and classifies read failures:
+  `IsForbidden` → `ReadForbidden`, `IsNotFound` → not-ready, anything else →
+  `EvaluationFailed`.
+- `summarize` is the **only** place the condition's status, reason and message are
+  derived, applying a fixed reason precedence. Add new reasons there, not inline.
+- Readiness predicates (`deploymentReady`, `jobComplete`, …) are pure functions over
+  an API object. Keep them that way — they're the best-tested part of the codebase.
 
-### Environment variables:
-- GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES (CSV)
-- GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES (CSV)
+### Adding a check type
 
-## Security requirements (do not regress)
+1. Add the schema block to `crd.yaml` **and** the key to the CEL rule's list.
+2. Add the key to `countCheckTypes()` in `main.go`.
+3. Add a branch to `evalOne()` and a pure predicate function.
+4. Add the kind to `rbac.yaml`, and to the table in `README.md`.
+5. Table-test the predicate in `main_test.go`.
 
-1. Never trust request parameters alone
-  - Always authenticate via TokenReview.
-  - Always authorize via SubjectAccessReview (SAR) for:
-    - reading the Gate (in platform mode when ns differs)
-    - each check’s resource access
-2. No “kubectl exec” / no shelling out
-  - Use client-go.
-3. Allowlist check types
-  - Do not add “generic resource query” endpoints that allow arbitrary GVR access.
-4. No cross-namespace in customer mode
-  - Even if requested by query params.
-5. Avoid data leakage
-  - Never return resource contents. Return only readiness booleans and human-safe messages.
+If the dependency can enter a state it will never leave without human action, the
+predicate must report `terminal` — see Decisions.
 
-## Usage patterns
+## Rules
 
-Common Gate patterns (see README.md for full examples with YAML):
-- **Simple dependency**: Gate with `deploymentAvailable` to wait for a database before deploying an app
-- **Migration gate**: Combine `statefulSetReady` + `jobComplete` to wait for DB + migration
-- **Service readiness**: Use `serviceReadyEndpoints` and `podLabelReady` to wait for backing services
-- **Cross-namespace platform gate**: Use `argoApplicationHealthy` with `namespace` overrides to gate on an observability stack across platform namespaces (requires platform mode)
-- **Mixed checks**: A single Gate can combine any check types; each check must set exactly one type
+- **Never return resource contents.** Status carries readiness booleans and
+  human-safe messages only. Don't echo arbitrary upstream fields into a Gate's
+  status; a Gate is readable by anyone who can read its namespace.
+- **Never grant `secrets` or `configmaps`** in `rbac.yaml`. That ClusterRole is the
+  only thing bounding what a Gate can observe.
+- **Enforce the namespace policy before reading.** `customer` mode is
+  namespace-local; `platform` mode is allowlist-bounded. Both allowlists default to
+  empty and must stay that way.
+- **A read failure is not a "not ready" answer.** Transient errors must produce
+  `Ready=Unknown`, never `False`, or one API blip flips a healthy Gate and interrupts
+  a wave that was about to proceed.
+- **Preserve `lastTransitionTime` unless the status actually changes.** It means "when
+  this last changed", and restamping it every sweep turns reconciliation into
+  continuous writes that wake every Argo CD watcher.
+- **Keep `Server` immutable after `main()`.** The reconcile loop owns all state; the
+  only shared field is `lastSweep` (an atomic). Don't add mutable fields — put
+  per-sweep state in locals.
+- Use client-go; never shell out.
 
-Key design point: Gatekeeper fetches each resource by name — it does **not** list or watch. The Gate CR is the source of truth for what to check. Caller SAs only need `get` (for named resources) or `list` (for pod/endpointslice collection queries).
+## Decisions
 
-## Development workflows
-### Local run
-- go run . uses:
-  - in-cluster config if available
-  - otherwise falls back to KUBECONFIG
+Settled choices, with their accepted edge cases. Don't re-raise these without new
+information.
 
-### Testing
-- Unit tests: `go test ./...`
-- Integration tests: see `examples/` directory
+1. **Published status, not a request API.** The HTTP `/check` and `/explain`
+   endpoints, TokenReview authentication and per-caller SubjectAccessReview were all
+   removed in `v1alpha2`. The driver was consumer ergonomics: the old design required
+   a PreSync hook Job plus a ServiceAccount, Role and RoleBinding per app, each
+   carrying a copy of a shell retry loop.
+2. **Accepted: readiness can be stale.** A gatekeeper that is down leaves Gates at
+   their last value, and neither Argo CD nor `kubectl wait` can tell how old that is,
+   so a rollout gated on an already-`Ready` Gate may proceed unverified. There is no
+   Kubernetes primitive that fixes this — no per-object TTL, no admission on read
+   paths. A heartbeat Lease plus a watchdog that marks Gates stale was designed and
+   **rejected**: it bought about a minute of detection over ordinary Deployment
+   alerting while becoming the only component able to block every rollout in the
+   cluster. The mitigation is one alert (`prometheusrule.yaml`).
+   **The open edge case:** a gate protecting something irreversible, such as a
+   migration an app must not start before, does not self-heal. Nothing in the tooling
+   prevents writing one. If that comes up, add a synchronous check that fails closed
+   rather than reintroducing a watchdog.
+3. **Accepted: no cross-Application gating.** Sync waves only order resources within
+   one Application. A PreSync Job running `kubectl wait` covers it, but only if the
+   Gate already exists, so it isn't shipped as a supported pattern.
+4. **The Argo CD Lua health check is required, not optional.** Argo CD skips
+   resources with no health check in its health rollup, so without
+   `examples/argocd-health-check.yaml` a Gate gates nothing. Its `observedGeneration`
+   guard is also required: without it an edited Gate is judged against the condition
+   left from its previous spec and gets bypassed on the very sync that tightened it.
+5. **`--sync-timeout` must be set cluster-wide.** It defaults to never, and a Running
+   sync operation blocks later auto-syncs of that Application including the fix. This
+   is also what turns a hung wave into a visible failure.
+6. **Terminal is distinct from not-ready, and derived in Go.** A failed Job, a
+   Degraded Application and a stalled HelmRelease will not recover on their own, so
+   they surface as `reason: Terminal` → Argo CD `Degraded` → prompt sync failure. A
+   declarative `terminalWhen` field was rejected: it pushes per-technology trivia into
+   tenant YAML and can't express the Job case at all.
+7. **`spec.strict` was removed.** It claimed non-strict Gates could pass with skipped
+   checks, which the code never did. Every check is always evaluated and reported, and
+   a check that cannot be evaluated always blocks the Gate.
+8. **No generic "check any resource" type.** Each check type is explicit. A generic
+   `condition` check was rejected: it needs a GVR allowlist, cluster-scope rejection
+   and message redaction to be safe, which is a poor trade for the two technologies
+   actually in use. Add a concrete check type instead — it's ~25 lines.
+9. **Rejected: per-check status-write diffing.** At this scale always patching is
+   ~0.3 writes/s and Argo CD already suppresses redundant requeues, while diffing
+   introduced a silent fail-stuck bug. Inherit `lastTransitionTime`; write everything
+   else unconditionally.
+10. **This model assumes tenants cannot `patch` namespaces.** The `customer`/`platform`
+    mode label is the policy boundary, so a tenant able to relabel their own namespace
+    could promote themselves to platform mode.
 
-### Manual testing tips
- - Use curl -i when debugging to see non-JSON error bodies and HTTP status.
- - To simulate a real client:
-    - create a ServiceAccount token with kubectl create token
-    - call /check?gate=<name>[&ns=<gate-ns>] with Authorization: Bearer <token>
+## Ownership
 
-## What AI assistants should do when modifying code
-### Preferred changes
-- Keep HTTP surface area minimal.
-- Add new check types by:
-  - updating CRD schema
-  - implementing evaluation in Go
-  - adding SAR checks and RBAC documentation
-- Improve error reporting:
-  - differentiate 400 (bad spec), 403 (forbidden), 409 (not ready), 404 (missing gate)
-
-### Avoid
-- Introducing broad RBAC requirements (“cluster-admin”-like)
-- Removing SAR enforcement
-- Adding endpoints that accept arbitrary resource kinds/namespaces from user input without strict policy & authorization
-
-## Suggested future enhancements (safe direction)
-- Structured JSON error responses
-- Metrics endpoint (/metrics) with Prometheus counters
-- Admission validation for Gate objects (reject unsafe specs at creation time)
-
-## Contact / ownership
-- Maintained by GlueOps core platform team.
-- This service is security-sensitive: changes must be reviewed with multi-tenancy and RBAC implications in mind.
+Maintained by the GlueOps core platform team. Changes here affect whether production
+rollouts are correctly gated — review with multi-tenancy and failure modes in mind.

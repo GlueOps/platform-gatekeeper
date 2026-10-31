@@ -1,0 +1,83 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+spec:
+  replicas: 1
+  # Recreate rather than RollingUpdate: two reconcilers writing the same Gate
+  # statuses during a rollout is wasteful, and there is nothing to keep available
+  # since no request path depends on this pod.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glueops-core-gatekeeper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: glueops-core-gatekeeper
+    spec:
+      serviceAccountName: glueops-core-gatekeeper
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gatekeeper
+          image: ghcr.io/glueops/platform-gatekeeper:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Cross-namespace checks are refused unless the target matches one of
+            # these. Unset means no cross-namespace access at all.
+            - name: GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES
+              value: "glueops-core"
+            - name: GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES
+              value: "glueops-core-"
+            - name: GATEKEEPER_RECONCILE_INTERVAL
+              value: "30s"
+          # A plain process check on purpose. Tying liveness to sweep success would
+          # turn an apiserver outage into CrashLoopBackOff, and a restarting pod
+          # reconciles less than a wedged one. Staleness is an alert (see
+          # prometheusrule.yaml), not a restart.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+spec:
+  selector:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

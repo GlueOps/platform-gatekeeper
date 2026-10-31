@@ -1,0 +1,22 @@
+# The Gate and the workloads it gates must be in the *same* Application: sync
+# waves only order resources within one sync operation. Gating across Applications
+# is not supported by this pattern.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/your-manifests
+    targetRevision: main
+    # A directory holding gate.yaml and deployment.yaml together.
+    path: apps/my-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nonprod
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

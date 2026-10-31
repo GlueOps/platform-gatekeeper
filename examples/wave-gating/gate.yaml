@@ -1,0 +1,22 @@
+# The Gate declares what must be ready before the rest of the Application rolls
+# out. It goes in sync-wave -1 so Argo CD applies it, waits for it to report
+# Healthy, and only then proceeds to the default wave (0) where the workloads live.
+#
+# Wave -1 and not 0: the default wave *is* 0, so a Gate at 0 would be applied in
+# the same wave as any un-annotated resource and would gate nothing.
+apiVersion: platform.glueops.dev/v1alpha2
+kind: Gate
+metadata:
+  name: my-app-dependencies
+  namespace: nonprod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  checks:
+    - id: database
+      deploymentAvailable:
+        name: postgres
+        minAvailableReplicas: 1
+    - id: migration
+      jobComplete:
+        name: my-app-migrate

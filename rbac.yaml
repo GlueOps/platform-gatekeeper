@@ -11,30 +11,32 @@ metadata:
   name: glueops-core-gatekeeper
   namespace: glueops-core-gatekeeper
 ---
+# This ClusterRole is the ceiling on what any Gate can observe. Gatekeeper reads
+# dependencies with its own identity, so a kind granted here becomes readable by
+# any Gate (within its own namespace, or an allowlisted namespace in platform
+# mode). Add kinds deliberately, and never grant secrets or configmaps.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: glueops-core-gatekeeper
 rules:
+  # The reconcile loop lists every Gate each sweep and writes its status.
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates"]
-    verbs: ["get"]
+    verbs: ["get", "list"]
 
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates/status"]
-    verbs: ["patch","update"]
+    verbs: ["patch", "update"]
 
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["tokenreviews"]
-    verbs: ["create"]
+  # Resolves the customer/platform mode label on a Gate's namespace.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
 
-  - apiGroups: ["authorization.k8s.io"]
-    resources: ["subjectaccessreviews"]
-    verbs: ["create"]
-
-  # allowlisted reads:
+  # Allowlisted dependency reads, one rule per supported check type.
   - apiGroups: ["apps"]
-    resources: ["deployments","statefulsets"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get"]
 
   - apiGroups: ["batch"]
@@ -45,25 +47,21 @@ rules:
     resources: ["services"]
     verbs: ["get"]
 
-  - apiGroups: [ "" ]
-    resources: [ "pods" ]
-    verbs: [ "list" ]
-
-  - apiGroups: [ "" ]
-    resources: [ "namespaces" ]
-    verbs: [ "get" ]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
 
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list"]
 
-  - apiGroups: [ "argoproj.io" ]
-    resources: [ "applications" ]
-    verbs: [ "get" ]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get"]
 
-  - apiGroups: [ "helm.toolkit.fluxcd.io" ]
-    resources: [ "helmreleases" ]
-    verbs: [ "get" ]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

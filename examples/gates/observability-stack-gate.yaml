@@ -1,24 +1,33 @@
-apiVersion: platform.glueops.dev/v1alpha1
+# Cross-namespace gating, which requires platform mode: this Gate's namespace must
+# carry `gatekeeper.platform.glueops.dev/mode: platform`, and every target namespace
+# must match GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES or one of the configured
+# prefixes. Otherwise each check reports a PolicyViolation and the Gate stays
+# blocked.
+#
+# Note the Gate must live in the same Argo CD Application as the workloads it gates
+# -- sync waves only order resources within one Application.
+apiVersion: platform.glueops.dev/v1alpha2
 kind: Gate
 metadata:
   name: observability-stack-complete
   namespace: glueops-core-gatekeeper
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
-  strict: true
   checks:
     - id: prometheus
+      namespace: glueops-core-kube-prometheus-stack
       argoApplicationHealthy:
         name: prometheus
-      namespace: glueops-core-kube-prometheus-stack
     - id: thanos
+      namespace: glueops-core-thanos
       argoApplicationHealthy:
         name: thanos
-      namespace: glueops-core-thanos
     - id: tempo
+      namespace: glueops-core-tempo
       argoApplicationHealthy:
         name: tempo
-      namespace: glueops-core-tempo
     - id: loki
+      namespace: glueops-core-loki
       argoApplicationHealthy:
         name: loki
-      namespace: glueops-core-loki

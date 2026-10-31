@@ -11,11 +11,21 @@ spec:
     kind: Gate
     shortNames: ["gate"]
   versions:
-    - name: v1alpha1
+    - name: v1alpha2
       served: true
       storage: true
       subresources:
         status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Reason
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].reason
+        - name: Last-Transition
+          type: date
+          jsonPath: .status.conditions[?(@.type=="Ready")].lastTransitionTime
       schema:
         openAPIV3Schema:
           type: object
@@ -25,29 +35,41 @@ spec:
               type: object
               required: ["checks"]
               properties:
-                # Optional: if true, fail when spec references disallowed kinds/targets
-                strict:
-                  type: boolean
-                  default: true
-                  description: "If true, the gate will be marked failed if any checks reference disallowed resource kinds or targets. If false, such checks will be ignored but the gate can still pass if all other checks pass."
                 checks:
                   type: array
                   minItems: 1
+                  # maxItems is required, not cosmetic: CEL cost estimation
+                  # multiplies per-item cost by maxItems, and an unbounded list can
+                  # get the whole CRD rejected at apply time.
+                  maxItems: 32
                   items:
                     type: object
                     required: ["id"]
+                    # Structural pruning drops an unknown field before validation,
+                    # so a misspelled check type (deploymentAvailible) would leave a
+                    # check with only an id and silently verify nothing. This is the
+                    # only place that can catch it.
+                    x-kubernetes-validations:
+                      - rule: >-
+                          [has(self.deploymentAvailable), has(self.statefulSetReady),
+                           has(self.jobComplete), has(self.serviceReadyEndpoints),
+                           has(self.podLabelReady), has(self.argoApplicationHealthy),
+                           has(self.fluxHelmReleaseReady)].exists_one(x, x)
+                        message: "each check must set exactly one check type"
                     properties:
                       id:
                         type: string
                         minLength: 1
                         maxLength: 63
-                      # default namespace is Gate's namespace
+                      # Defaults to the Gate's own namespace. A different namespace
+                      # requires the Gate's namespace to be in platform mode and the
+                      # target to be on gatekeeper's allowlist.
                       namespace:
                         type: string
                         minLength: 1
                         maxLength: 63
 
-                      # Exactly one of these blocks should be set:
+                      # Exactly one of the blocks below must be set.
                       deploymentAvailable:
                         type: object
                         required: ["name"]
@@ -75,7 +97,6 @@ spec:
                         properties:
                           name: { type: string, minLength: 1 }
                           minReadyAddresses: { type: integer, minimum: 0, default: 1 }
-                          # Optional: name/port matching etc. can be added later
 
                       podLabelReady:
                         type: object
@@ -110,9 +131,26 @@ spec:
             status:
               type: object
               properties:
-                observedGeneration: { type: integer }
-                ready: { type: boolean }
-                lastEvaluatedTime: { type: string, format: date-time }
+                observedGeneration: { type: integer, minimum: 0 }
+                conditions:
+                  type: array
+                  # Gatekeeper computes the whole array each sweep, but the list-map
+                  # keying makes a duplicate Ready condition a validation error rather
+                  # than something a consumer has to disambiguate.
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: ["type"]
+                  items:
+                    type: object
+                    required: ["type", "status", "reason", "lastTransitionTime"]
+                    properties:
+                      type: { type: string, minLength: 1, maxLength: 316 }
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason: { type: string, minLength: 1, maxLength: 1024 }
+                      message: { type: string, maxLength: 32768 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      observedGeneration: { type: integer, minimum: 0 }
                 results:
                   type: array
                   items:
@@ -121,4 +159,9 @@ spec:
                     properties:
                       id: { type: string }
                       ready: { type: boolean }
+                      reason: { type: string }
                       message: { type: string }
+                      # True when the dependency cannot become ready without a change
+                      # (a failed Job, a Degraded Application, a stalled HelmRelease),
+                      # so a consumer should stop waiting rather than time out.
+                      terminal: { type: boolean }

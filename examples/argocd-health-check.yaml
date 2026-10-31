@@ -1,0 +1,58 @@
+# Platform setup, applied once per Argo CD instance. Merge this into the existing
+# argocd-cm ConfigMap (do not replace it -- argocd-cm holds other settings).
+#
+# This is not optional polish. Argo CD has no built-in health assessment for a
+# Gate, and a resource with no health check is *skipped* in the Application health
+# rollup -- the wave task is marked succeeded immediately and the next wave
+# proceeds ungated. Without this script, Gates do nothing.
+#
+# Editing argocd-cm needs no restart, but it does trigger a full re-list, and a
+# syntax error in the script yields health Unknown, which the sync loop silently
+# ignores while the wave hangs. Test changes against a real Gate object first.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: argocd-cm
+    app.kubernetes.io/part-of: argocd
+data:
+  resource.customizations.health.platform.glueops.dev_Gate: |
+    hs = {}
+    if obj.status == nil or obj.status.conditions == nil then
+      hs.status = "Progressing"
+      hs.message = "Awaiting first evaluation"
+      return hs
+    end
+    -- Required, not defensive: without this an edited Gate is judged against the
+    -- condition left over from its previous spec, so Argo CD sees Healthy and
+    -- proceeds, bypassing the gate on the very sync that tightened it.
+    if obj.metadata.generation ~= nil and obj.status.observedGeneration ~= obj.metadata.generation then
+      hs.status = "Progressing"
+      hs.message = "Awaiting evaluation of current spec"
+      return hs
+    end
+    for i, c in ipairs(obj.status.conditions) do
+      if c.type == "Ready" then
+        hs.message = (c.reason or "") .. ": " .. (c.message or "")
+        if c.status == "True" then
+          hs.status = "Healthy"
+          return hs
+        end
+        -- Terminal means the dependency cannot become ready without a change (a
+        -- failed Job, a Degraded Application, a stalled HelmRelease). Degraded
+        -- fails the sync operation promptly instead of waiting out the timeout.
+        if c.reason == "Terminal" then
+          hs.status = "Degraded"
+          return hs
+        end
+        -- Everything else, including Unknown, means keep waiting. An unevaluable
+        -- gate makes no claim about the dependency, so Degraded would be wrong.
+        hs.status = "Progressing"
+        return hs
+      end
+    end
+    hs.status = "Progressing"
+    hs.message = "No Ready condition"
+    return hs

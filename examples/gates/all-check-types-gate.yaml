@@ -1,35 +1,54 @@
-apiVersion: platform.glueops.dev/v1alpha1
+# Reference for every supported check type. Each check sets exactly one type --
+# the CRD rejects a check that sets none or more than one, which is also what
+# catches a misspelled type name (the API server prunes unknown fields, so a typo
+# would otherwise leave a check that silently verifies nothing).
+apiVersion: platform.glueops.dev/v1alpha2
 kind: Gate
 metadata:
   name: full-stack-ready
   namespace: nonprod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
-  strict: true
   checks:
     - id: database
       statefulSetReady:
         name: postgres
         minReadyReplicas: 1
         requireUpdatedRevision: true
+
     - id: migration
       jobComplete:
         name: db-migrate
+
     - id: cache
       serviceReadyEndpoints:
         name: redis
         minReadyAddresses: 1
+
     - id: api
       deploymentAvailable:
         name: api-server
         minAvailableReplicas: 2
+
     - id: workers
       podLabelReady:
+        # Prefer a specific selector: a broad one lists many pods on every sweep.
         selector: "app=worker"
         minReadyPods: 3
+
     - id: monitoring
       argoApplicationHealthy:
         name: monitoring-stack
+        requireSynced: true
+        requireHealthy: true
+
+    # Flux HelmReleases usually live in the namespace Flux reconciles from rather
+    # than alongside the workload, hence the namespace override -- which requires
+    # this Gate's namespace to be in platform mode and glueops-core-flux to be on
+    # gatekeeper's allowlist.
     - id: cert-manager
       namespace: glueops-core-flux
       fluxHelmReleaseReady:
         name: cert-manager
+        requireCurrentGeneration: true
