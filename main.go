@@ -22,6 +22,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/dynamic"
@@ -51,7 +52,9 @@ const (
 	minReconcileInterval     = time.Second
 	// Bounds how far a serial sweep can be dragged out by a dead dependency.
 	perGateTimeout = 10 * time.Second
-	maxMessageLen  = 1024
+	// Separate from the read budget so a Gate that exhausts it can still publish.
+	statusWriteTimeout = 5 * time.Second
+	maxMessageLen      = 1024
 )
 
 // Not configurable: a different group or plural means a different CRD.
@@ -262,27 +265,39 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 		}
 	}()
 
-	ctx, cancel := context.WithTimeout(ctx, perGateTimeout)
-	defer cancel()
+	readCtx, cancelRead := context.WithTimeout(ctx, perGateTimeout)
+	defer cancelRead()
+	// The write gets its own budget from the parent, not what's left of the read
+	// one: a Gate that spends the whole read budget must still publish the Unknown
+	// it concluded, or it keeps a stale -- possibly True -- condition that the Argo
+	// CD health check reads as Healthy.
+	writeCtx, cancelWrite := context.WithTimeout(ctx, statusWriteTimeout)
+	defer cancelWrite()
 
 	ns := gate.GetNamespace()
 	mode, cached := modes[ns]
 	if !cached {
-		resolved, modeErr := s.namespaceMode(ctx, ns)
+		resolved, modeErr := s.namespaceMode(readCtx, ns)
 		if modeErr != nil {
-			// Undecidable policy: make no claim rather than assume a mode.
-			return metav1.ConditionUnknown, s.writeStatus(ctx, gate, metav1.ConditionUnknown,
-				reasonEvaluationFailed, fmt.Sprintf("namespace mode lookup failed: %v", modeErr), nil)
+			// Forbidden is gatekeeper's own ClusterRole, which an operator must fix;
+			// anything else is indeterminate. Never echo the error -- it names the
+			// ServiceAccount and reaches the Argo CD UI.
+			if apierrors.IsForbidden(modeErr) {
+				return metav1.ConditionFalse, s.writeStatus(writeCtx, gate, metav1.ConditionFalse,
+					reasonReadForbidden, "namespace read forbidden: grant core/namespaces get in gatekeeper's ClusterRole", nil)
+			}
+			return metav1.ConditionUnknown, s.writeStatus(writeCtx, gate, metav1.ConditionUnknown,
+				reasonEvaluationFailed, "namespace mode lookup failed", nil)
 		}
 		mode = resolved
 		modes[ns] = mode
 	}
 
-	results := s.evaluateGate(ctx, mode, ns, gate)
+	results := s.evaluateGate(readCtx, mode, ns, gate)
 
 	var reason, message string
 	status, reason, message = summarize(results)
-	return status, s.writeStatus(ctx, gate, status, reason, message, results)
+	return status, s.writeStatus(writeCtx, gate, status, reason, message, results)
 }
 
 func (s *Server) namespaceMode(ctx context.Context, ns string) (string, error) {
@@ -504,6 +519,11 @@ func (s *Server) evalOne(ctx context.Context, ns, id string, check map[string]an
 		if selector == "" {
 			return specErr(id, "podLabelReady.selector required")
 		}
+		if _, perr := labels.Parse(selector); perr != nil {
+			// Otherwise the apiserver's 400 lands in readErr's indeterminate branch
+			// and the Gate reports Unknown every sweep, waiting forever on a typo.
+			return specErr(id, "podLabelReady.selector is not a valid label selector")
+		}
 		minReady := int64(numOr(block["minReadyPods"], 1))
 
 		pods, err := s.kube.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{LabelSelector: selector})
@@ -542,7 +562,7 @@ func (s *Server) evalOne(ctx context.Context, ns, id string, check map[string]an
 		ready, msg, terminal, upstreamErr := argoAppReady(app, requireSynced, requireHealthy)
 		if upstreamErr != nil {
 			// Upstream's status is malformed, not the Gate author's mistake.
-			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(upstreamErr.Error())}
+			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: "application status is malformed"}
 		}
 		return withTerminal(id, ready, msg, terminal)
 	}
@@ -565,7 +585,7 @@ func (s *Server) evalOne(ctx context.Context, ns, id string, check map[string]an
 		}
 		ready, msg, terminal, upstreamErr := fluxHelmReleaseReady(hr, requireCurrentGeneration)
 		if upstreamErr != nil {
-			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(upstreamErr.Error())}
+			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: "helmrelease status is malformed"}
 		}
 		return withTerminal(id, ready, msg, terminal)
 	}
@@ -637,6 +657,12 @@ func statefulSetReady(sts *appsv1.StatefulSet, minReady int64, requireUpdated bo
 		return false, fmt.Sprintf("readyReplicas %d < %d", ready, minReady)
 	}
 	if requireUpdated {
+		// Generation currency first: readyReplicas and the revisions are all status
+		// the controller may not have refreshed yet, so without this the check
+		// passes on status left from before the dependency's spec changed.
+		if sts.Status.ObservedGeneration < sts.Generation {
+			return false, fmt.Sprintf("status is stale (observedGeneration %d < generation %d)", sts.Status.ObservedGeneration, sts.Generation)
+		}
 		if sts.Status.UpdateRevision != "" && sts.Status.CurrentRevision != "" &&
 			sts.Status.UpdateRevision != sts.Status.CurrentRevision {
 			return false, fmt.Sprintf("revision not fully updated (current=%s update=%s)", sts.Status.CurrentRevision, sts.Status.UpdateRevision)

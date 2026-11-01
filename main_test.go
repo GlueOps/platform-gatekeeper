@@ -1264,13 +1264,35 @@ func TestEveryCheckTypeDispatches(t *testing.T) {
 			wantPass: true,
 		},
 		{
-			// Proves requireUpdatedRevision is read; with it defaulted true this
-			// mid-rollout StatefulSet must not pass.
+			// A value the default cannot produce: with the key typo'd, the default 1
+			// is used and one ready replica passes.
+			name:  "statefulSetReady honours minReadyReplicas",
+			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "minReadyReplicas": int64(2)}},
+			kubeObjs: []runtime.Object{&appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "nonprod"},
+				Status:     appsv1.StatefulSetStatus{ReadyReplicas: 1, CurrentRevision: "r1", UpdateRevision: "r1"},
+			}},
+			wantPass: false,
+		},
+		{
+			// Set FALSE, which the default (true) cannot produce: a mid-rollout
+			// StatefulSet passes only if the key was actually read.
 			name:  "statefulSetReady honours requireUpdatedRevision",
-			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "requireUpdatedRevision": true}},
+			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "requireUpdatedRevision": false}},
 			kubeObjs: []runtime.Object{&appsv1.StatefulSet{
 				ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "nonprod"},
 				Status:     appsv1.StatefulSetStatus{ReadyReplicas: 2, CurrentRevision: "r1", UpdateRevision: "r2"},
+			}},
+			wantPass: true,
+		},
+		{
+			// The generation guard inside requireUpdatedRevision: status predating
+			// the dependency's spec change must not pass.
+			name:  "statefulSetReady rejects stale status",
+			check: map[string]any{"id": "c", "statefulSetReady": map[string]any{"name": "s", "requireUpdatedRevision": true}},
+			kubeObjs: []runtime.Object{&appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "nonprod", Generation: 2},
+				Status:     appsv1.StatefulSetStatus{ObservedGeneration: 1, ReadyReplicas: 2, CurrentRevision: "r1", UpdateRevision: "r1"},
 			}},
 			wantPass: false,
 		},
@@ -1340,14 +1362,25 @@ func TestEveryCheckTypeDispatches(t *testing.T) {
 			wantPass: true,
 		},
 		{
-			// Proves requireSynced is read: OutOfSync must block by default.
+			// Set FALSE, which the default (true) cannot produce: OutOfSync passes
+			// only if the key was read.
 			name:  "argoApplicationHealthy honours requireSynced",
-			check: map[string]any{"id": "c", "argoApplicationHealthy": map[string]any{"name": "app"}},
+			check: map[string]any{"id": "c", "argoApplicationHealthy": map[string]any{"name": "app", "requireSynced": false}},
 			dynObjs: []runtime.Object{unstructuredObj("argoproj.io/v1alpha1", "Application", "nonprod", "app", map[string]any{
 				"health": map[string]any{"status": "Healthy"},
 				"sync":   map[string]any{"status": "OutOfSync"},
 			})},
-			wantPass: false,
+			wantPass: true,
+		},
+		{
+			// requireHealthy had no row at all.
+			name:  "argoApplicationHealthy honours requireHealthy",
+			check: map[string]any{"id": "c", "argoApplicationHealthy": map[string]any{"name": "app", "requireHealthy": false}},
+			dynObjs: []runtime.Object{unstructuredObj("argoproj.io/v1alpha1", "Application", "nonprod", "app", map[string]any{
+				"health": map[string]any{"status": "Degraded"},
+				"sync":   map[string]any{"status": "Synced"},
+			})},
+			wantPass: true,
 		},
 		{
 			name:  "fluxHelmReleaseReady satisfied",
@@ -1361,10 +1394,10 @@ func TestEveryCheckTypeDispatches(t *testing.T) {
 			wantPass: true,
 		},
 		{
-			// Proves requireCurrentGeneration is read: a stale observedGeneration
-			// must block even though Ready=True.
+			// Set FALSE, which the default (true) cannot produce: a stale
+			// observedGeneration passes only if the key was read.
 			name:  "fluxHelmReleaseReady honours requireCurrentGeneration",
-			check: map[string]any{"id": "c", "fluxHelmReleaseReady": map[string]any{"name": "hr"}},
+			check: map[string]any{"id": "c", "fluxHelmReleaseReady": map[string]any{"name": "hr", "requireCurrentGeneration": false}},
 			dynObjs: []runtime.Object{func() runtime.Object {
 				o := unstructuredObj("helm.toolkit.fluxcd.io/v2", "HelmRelease", "nonprod", "hr", map[string]any{
 					"observedGeneration": int64(1),
@@ -1375,7 +1408,7 @@ func TestEveryCheckTypeDispatches(t *testing.T) {
 				_ = unstructured.SetNestedField(o.Object, int64(5), "metadata", "generation")
 				return o
 			}()},
-			wantPass: false,
+			wantPass: true,
 		},
 	}
 
