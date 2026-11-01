@@ -31,6 +31,7 @@ credentials and need no RBAC.
 | `prometheusrule_test.yaml` | promtool unit tests for those alerts — see the header for how to run them |
 | `examples/wave-gating/` | the worked example a consumer copies |
 | `examples/argocd-health-check.yaml` | the Lua health check for `argocd-cm` — **required**, see Decisions |
+| `examples/argocd-health-check_test.lua` | tests for that script — run them before changing it, see the file header |
 
 ## Build and test
 
@@ -235,5 +236,7 @@ Verified against upstream, and easy to get wrong:
   for that sync.
 - **A Lua error yields health `Unknown`**, which the sync loop ignores — the wave
   hangs with the Application showing Unknown rather than Degraded, and nothing
-  alerts. Test `examples/argocd-health-check.yaml` against a real Gate object before
-  shipping a change to it.
+  alerts. So `examples/argocd-health-check_test.lua` covers all eleven branches,
+  including the generation guard and `Terminal` → `Degraded`; run it before changing
+  the script. Mutation-checked: removing the generation guard makes the stale-`True`
+  case return `Healthy`, which is the bypass it exists to prevent.
