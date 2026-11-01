@@ -91,7 +91,7 @@ tests:
           - exp_labels: { severity: warning }
             exp_annotations: &unevaluated_annotations
               summary: Gatekeeper cannot evaluate some Gates
-              description: "One or more Gates have been stuck with Ready=Unknown. Gated rollouts are waiting rather than proceeding, so this blocks deploys rather than risking them. Find the affected Gates with `kubectl get gates -A | grep Unknown` and read `.status.results` for the reason; common causes are gatekeeper's ClusterRole missing a kind and the Kubernetes API rejecting its reads."
+              description: "One or more Gates have been stuck with Ready=Unknown. Gated rollouts are waiting rather than proceeding, so this blocks deploys rather than risking them. Find the affected Gates with `kubectl get gates -A | grep Unknown` and read `.status.results` for the reason: the API server rejecting gatekeeper's reads, or a dependency whose status cannot be interpreted. Note a missing kind in gatekeeper's ClusterRole does NOT show up here -- that is ReadForbidden, which is Ready=False and surfaces as a Degraded Application instead."
       # The staleness alert must stay quiet throughout: the sweeps are fine.
       - eval_time: 16m
         alertname: GatekeeperNotReconciling

@@ -164,6 +164,16 @@ trying — see Decision 6.
   side silently disables the alerts; `TestHandleMetricsExposesTheAlertedSeries`
   guards it.
 - Use client-go; never shell out.
+- **Gates are evaluated serially and the client is capped at 50 QPS / 100 burst.**
+  Measured on k3d: 206 two-check Gates sweep in ~6.4s steady-state, about 64 reads/s,
+  so past roughly 250 two-check Gates the rate limiter starts pacing sweeps and
+  staleness grows linearly with the fleet. Around 470 maximum-size Gates a sweep
+  would exceed the alert's 300s threshold. Raise the threshold, or parallelise
+  evaluation, before that point.
+- **`fluxHelmReleaseReady` pins `helm.toolkit.fluxcd.io/v2`**, served by Flux 2.3 and
+  later. On an older Flux (v2beta1/v2beta2) the read 404s and the Gate reports "not
+  found" forever rather than saying the version is wrong. Not handled because this
+  platform does not run Flux; if that changes, probe the older versions.
 
 ## Decisions
 
@@ -232,9 +242,11 @@ information.
    ~0.3 writes/s and Argo CD already suppresses redundant requeues, while diffing
    introduced a silent fail-stuck bug. Inherit `lastTransitionTime`; write everything
    else unconditionally.
-10. **This model assumes tenants cannot `patch` namespaces.** The `customer`/`platform`
-    mode label is the policy boundary, so a tenant able to relabel their own namespace
-    could promote themselves to platform mode.
+10. **This model assumes tenants cannot set namespace labels.** The
+    `customer`/`platform` mode label is the policy boundary, so a tenant who can set
+    it promotes themselves to platform mode. That means `patch` AND `update` on an
+    existing namespace, and `create` of a new one -- an RBAC review looking only for
+    `patch` misses two of the three.
 11. **A Gate must express steady state, not an event.** It is a managed resource in
     wave `-1` of *every* sync, re-evaluated each time — not a one-shot precondition.
     So the gated condition has to stay true for the life of the Application. Gating

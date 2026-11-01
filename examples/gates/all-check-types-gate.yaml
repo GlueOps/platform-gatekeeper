@@ -1,4 +1,13 @@
-# Reference for every supported check type. Each check sets exactly one type --
+# Reference for every supported check type.
+#
+# AS WRITTEN THIS NEEDS A PLATFORM-MODE NAMESPACE. The cert-manager check targets
+# another namespace, and in customer mode (the default) that is refused: measured,
+# the Gate reports `PolicyViolation -- cross-namespace checks not allowed in customer
+# mode`, which maps to Argo CD Degraded and FAILS the sync. Either drop that check or
+# put the Gate in a platform-mode namespace -- see observability-stack-gate.yaml,
+# which lives in glueops-core-gatekeeper.
+#
+# Each check sets exactly one type --
 # the CRD rejects a check that sets none or more than one, which is also what
 # catches a misspelled type name (the API server prunes unknown fields, so a typo
 # would otherwise leave a check that silently verifies nothing).

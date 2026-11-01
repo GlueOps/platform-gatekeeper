@@ -59,5 +59,8 @@ spec:
               are waiting rather than proceeding, so this blocks deploys rather than
               risking them. Find the affected Gates with
               `kubectl get gates -A | grep Unknown` and read `.status.results` for
-              the reason; common causes are gatekeeper's ClusterRole missing a kind
-              and the Kubernetes API rejecting its reads.
+              the reason: the API server rejecting gatekeeper's reads, or a
+              dependency whose status cannot be interpreted. Note a missing kind in
+              gatekeeper's ClusterRole does NOT show up here -- that is
+              ReadForbidden, which is Ready=False and surfaces as a Degraded
+              Application instead.

@@ -15,6 +15,10 @@ spec:
     server: https://kubernetes.default.svc
     namespace: nonprod
   syncPolicy:
+    # Without this both resources fail to apply on a cluster that has no `nonprod`,
+    # so nothing is gated.
+    syncOptions:
+      - CreateNamespace=true
     automated:
       prune: true
       # Note selfHeal does NOT rescue a sync that failed on a gate; the automated
