@@ -13,7 +13,7 @@ wave-gating/
 └── deployment.yaml    # the workload, no annotation (default wave 0)
 ```
 
-Three things decide whether this works:
+Four things decide whether this works:
 
 1. **`argocd-health-check.yaml` must be installed** (see below). Without it Argo CD
    has no health check for a `Gate`, treats it as having no health at all, and
@@ -25,8 +25,10 @@ Three things decide whether this works:
 3. **The Gate must be in the same Application** as the workloads it gates. Sync
    waves only order resources within a single sync.
 4. **The Gate must express steady state.** It is re-evaluated on every sync, so the
-   condition has to stay true for the life of the Application — see the note in
-   `wave-gating/gate.yaml` about why gating on a migration Job eventually wedges.
+   condition has to stay true for the life of the Application. Gating on a migration
+   `jobComplete` is the trap: it works until `ttlSecondsAfterFinished`, a
+   `HookSucceeded` hook or a prune removes the Job, after which every later sync of
+   that Application hangs at wave `-1`.
 
 ## Confirming it gates
 
@@ -51,11 +53,11 @@ one-key `argocd-cm` manifest would delete every other key in the live ConfigMap,
 Argo CD would then selfHeal it back — silently removing the health check and
 un-gating every Gate in the cluster.
 
-Your platform also needs `--sync-timeout` (or
-`ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT`) set on the application controller. It
-defaults to *never*, so a gate that legitimately never becomes ready would leave
-the sync Running indefinitely — and a Running operation blocks all later auto-syncs
-of that Application, including the commit that would fix the gate.
+`--sync-timeout` is deliberately left at its default of *never*: a Running operation
+keeps re-checking the wave, so it proceeds whenever the gate clears, whereas setting
+a timeout turns that into a failed operation with no retries. The cost is that a gate
+which never clears parks the operation until someone runs `argocd app terminate-op`.
+See README's install steps 4 and 5.
 
 ## Check type reference: `gates/`
 

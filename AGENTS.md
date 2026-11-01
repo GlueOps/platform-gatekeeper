@@ -91,9 +91,17 @@ a locally imported tag still tries to pull from the registry and fails. Patch th
 policy to `IfNotPresent` when testing imported builds.
 
 The CRD schema changed incompatibly without a version bump, which `v1alpha1`
-permits. Applying it over an older install works in place: the version never
-leaves `spec.versions`, so there is no `status.storedVersions` migration, and the
-apiserver prunes removed fields such as `spec.strict` from stored Gates.
+permits. The version never leaves `spec.versions`, so there is no
+`status.storedVersions` migration, and already-stored Gates simply have the removed
+fields pruned on their next write.
+
+**But a manifest still carrying `spec.strict` is REJECTED, not pruned** — verified:
+`kubectl apply` gives `strict decoding error: unknown field "spec.strict"` and
+server-side apply gives `.spec.strict: field not declared in schema`. Only
+`--validate=false` prunes silently. Since the CRD bundle lands before Argo CD, the
+ordering is a requirement, not a nicety: **tenant Git must drop `spec.strict` before
+the new CRD ships**, or every Application carrying one fails to sync with no rollback
+path but fix-forward.
 
 ## How evaluation is structured
 
@@ -198,7 +206,7 @@ information.
    longest legitimate sync in the cluster breaks unrelated Applications.
    **What `terminate-op` does not cover:** an operation that has already *failed*,
    which is what the `Degraded` reasons in Decision 15 produce. That case needs
-   `selfHeal: true`, a manual sync, or a new commit — see the auto-sync bullet under
+   the retry budget, a manual sync, or a new commit — see the auto-sync bullet under
    "Argo CD interactions worth knowing".
 6. **Terminal means the upstream controller has declared it stopped trying** — not
    "this looks unhealthy right now". Only a Job's `Failed=True` and a Flux
@@ -258,35 +266,33 @@ information.
     (a read failed, so no claim is made about the dependency) and
     `DependenciesNotReady` (the normal waiting state) must stay `Progressing`;
     `TestHealthCheckScriptMatchesTheReasonContract` enforces both halves.
-    **What this costs, measured rather than assumed — and it is not free.**
+    **What this costs, measured against Argo CD v3.5.6 — and it is not free.**
     `Degraded` fails the sync operation, and a *failed* operation blocks auto-sync of
-    that revision just as hard as a Running one (`Skipping auto-sync: failed previous
-    sync attempt to [rev] and will not retry`). So:
-    - With `selfHeal: true`, which the example ships and the README requires, the
-      controller re-initiates after the failure and recovers on its own ~40s after the
-      Gate clears. Fine.
-    - With `selfHeal: false` it is a wedge that only a new commit or a manual sync
-      clears — and **three of the four are fixed cluster-side with no commit**, so the
-      remediation itself cannot release it: `ReadForbidden` (add a kind to the
-      ClusterRole), `PolicyViolation` (relabel the namespace, or change gatekeeper's
-      allowlist env vars) and `Terminal` (delete the failed Job so it re-runs). Only
-      `InvalidSpec` is fixed by a commit, and it is the near-unreachable one.
-      `Terminal` is both the most common and the one that predates this change.
+    that revision (`Skipping auto-sync: failed previous sync attempt to [rev] and will
+    not retry`). Recovery comes from the automated operation's own retry budget — 5
+    retries, ~5½ min — and **not** from `selfHeal`: in `autoSync` the
+    `!lastAttemptedPhase.Successful()` check returns before the selfHeal branch. Two
+    Applications identical but for `selfHeal` produced byte-identical timelines; with
+    the fix applied inside the window one recovered in ~35s *with `selfHeal: false`*,
+    and with the fix applied after it neither recovered in 7+ minutes.
+    So a `Degraded` Gate gives you ~5½ minutes of self-recovery and then needs a
+    manual sync or a new commit. Three of the four reasons are fixed cluster-side with
+    no commit — `ReadForbidden` (grant a kind), `PolicyViolation` (relabel the
+    namespace or change the allowlist) and `Terminal` (delete the failed Job) — so
+    remediation usually lands *after* the budget and does not release it by itself.
 
-    The `Progressing` path does **not** have this problem, which is the honest cost of
-    this decision: while the operation is still Running it keeps re-checking the wave,
-    so a cluster-side fix at any point lets the sync proceed on its own. With
-    `--sync-timeout` left at its default (Decision 5) that grace window is
-    **unbounded**, so `Progressing` is the strictly more forgiving state and this
-    decision gives up more than a bounded window would.
-    What it buys in exchange is the only signal there is. Without a timeout a stuck
-    `Progressing` gate looks like an ordinary slow deploy *forever* and nothing
-    alerts; `Degraded` surfaces it on the Application and fires notifications. So the
-    trade is legibility against self-recovery, and it is sound only while
-    `selfHeal: true` holds — if that is ever dropped, revisit this.
-    (Two earlier versions of this note were wrong: the first claimed both paths reach
-    "the same blocked state" differing only in timing, the second put the window at
-    30 minutes, which assumed a `--sync-timeout` the platform does not set.)
+    The `Progressing` path has no such limit: a Running operation keeps re-checking
+    the wave, so with `--sync-timeout` at its default (Decision 5) a fix at any point
+    lets the sync proceed. `Progressing` is therefore strictly more recoverable, and
+    this decision trades that away for the only signal there is — a stuck
+    `Progressing` gate looks like an ordinary slow deploy forever and nothing alerts,
+    while `Degraded` surfaces on the Application and fires notifications. Sound
+    specifically because these four reasons never clear on their own, so the
+    unbounded grace window buys them nothing.
+    (Three earlier versions of this note were wrong: that both paths reach "the same
+    blocked state"; that the window was 30 minutes; and that `selfHeal: true` was what
+    provided recovery. The last was measured, with the two arms fixed at different
+    times, which made them incomparable.)
     `InvalidSpec` is near-unreachable in practice (`required` + `minLength: 1` on
     every check field, `required: ["checks"]`, `items: type: object`, and the CEL
     rule block every path that emits it); it is in the table for uniformity, so the
@@ -309,14 +315,15 @@ Verified against upstream, and easy to get wrong:
   while its declared dependency is down is the worse default. It remains the opt-out
   for teams where a `Degraded` Gate left in place keeping the Application `Degraded`
   matters more — most often one reporting `ReadForbidden`, not a failed Job.
-- **`automated` auto-sync needs `selfHeal: true` to recover from a gate failure, and
-  nothing warns you.** Measured: a *failed* sync operation blocks auto-sync of that
-  revision exactly as hard as a Running one — `Skipping auto-sync: failed previous
-  sync attempt to [rev] and will not retry for [rev]`. With `selfHeal: false`, fixing
-  the dependency does nothing: the Gate goes `True`, the Application stays `OutOfSync`
-  and the workload is never created until a *new commit* lands. With `selfHeal: true`
-  the controller re-initiates and recovers about 40s after the Gate clears. The
-  shipped example sets it; a team that turns it off loses gate recovery entirely.
+- **`selfHeal` is irrelevant to gate-failure recovery; the retry budget is what
+  matters.** Measured: a *failed* sync operation blocks auto-sync of that revision
+  (`Skipping auto-sync: failed previous sync attempt to [rev] and will not retry`),
+  and `autoSync` returns on `!lastAttemptedPhase.Successful()` *before* the selfHeal
+  branch. What recovers a gated sync is the automated operation's injected
+  `Retry{Limit: 5}` with exponential backoff, ~5½ min: fix the dependency inside it
+  and the sync succeeds ~35s later even with `selfHeal: false`; fix it after and
+  neither setting recovers. The way out then is a manual sync (works at the same
+  revision) or a new commit.
 - **A wedged Application can read `Healthy`.** Measured: after the dependency was
   fixed, the Application showed `health=Healthy` with `sync=OutOfSync` and the gated
   Deployment absent — the Gate was the only live resource, so the rollup followed it.

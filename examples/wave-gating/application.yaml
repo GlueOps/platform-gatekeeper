@@ -17,5 +17,6 @@ spec:
   syncPolicy:
     automated:
       prune: true
-      # Required: without it a gated sync that fails once never retries.
+      # Note selfHeal does NOT rescue a sync that failed on a gate; the automated
+      # operation's own retry budget (~5.5 min) is what does. See README step 5.
       selfHeal: true

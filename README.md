@@ -188,23 +188,28 @@ produces a sync task, and wave 0 runs immediately — the same silent un-gating 
 missing health check. The only signal is an `ExcludedResourceWarning` condition on
 the Application.
 
-### 4. Consider an Argo CD sync timeout — optional
+### 4. Leave `--sync-timeout` unset — recommended
 
-A gate that never becomes ready leaves the sync operation `Running` indefinitely,
-because `--sync-timeout` defaults to *never*. A Running operation blocks every later
-auto-sync of that Application, including the commit that would fix the gate, until
-someone runs:
+`--sync-timeout` defaults to *never*, and for gated Applications that default is the
+one you want. Measured against Argo CD v3.5.6:
+
+| | What happens when a gate blocks |
+| --- | --- |
+| **unset** (default) | the operation stays `Running` and keeps re-checking the wave, so it proceeds the moment the gate clears — however long that takes |
+| **set** | the operation goes `Failed` with `Operation terminated, triggered by controller sync timeout`, **with no retries at all**, and auto-sync is then blocked for that revision |
+
+So setting it does not convert a hang into a tidy failure — it converts a *recoverable*
+hang into a wedge that needs a manual sync or a new commit. The cost of leaving it
+unset is that a gate which never clears parks the operation indefinitely, blocking
+later auto-syncs of that Application, until someone runs:
 
 ```bash
 argocd app terminate-op <app>
 ```
 
-If your team is comfortable with that recovery, you can leave the default alone —
-this is the state the platform already runs in. Setting a timeout only buys you the
-same outcome without the manual step, by turning the hang into a `Failed` operation
-with `Operation terminated, triggered by controller sync timeout`.
-
-If you do set it:
+If you set it anyway, it is controller-wide with no per-Application override, so a
+value below the longest legitimate sync in the cluster will start failing syncs that
+used to succeed:
 
 ```bash
 kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge \
@@ -216,42 +221,30 @@ The restart is required — unlike `argocd-cm`, this ConfigMap is injected as
 environment variables and is only read at pod start. Under the argo-cd Helm chart,
 set it in `configs.params` instead.
 
-`1800` is a starting point: a Gate reports Ready within one reconcile interval (30s)
-of its dependency coming up, so the budget is almost entirely the dependency's own
-startup, and a cold platform-stack bootstrap is the long pole. **It is controller-wide
-and has no per-Application override**, so a value below the longest legitimate sync in
-the cluster — gated or not — will start failing syncs that used to succeed.
+### 5. Know how a failed gated sync recovers
 
-Note that `terminate-op` only releases an operation that is still *Running*. It does
-nothing once one has **failed**, which is what a `Degraded` Gate produces (step 5).
+**`selfHeal` does not help here, despite what you might expect.** In `autoSync` the
+`!lastAttemptedPhase.Successful()` check returns before the selfHeal branch is
+reached, so a failed operation blocks auto-sync of that revision either way.
 
-### 5. Use `selfHeal: true` — required for recovery
+What actually recovers a gated sync is the automated operation's own **retry budget**
+— 5 retries with exponential backoff, about 5½ minutes. Measured, with two
+Applications identical but for `selfHeal`:
 
-If your Applications use `syncPolicy.automated`, they need `selfHeal: true`:
+- Dependency fixed **inside** that window: `phase=Succeeded` ~35s later. True with
+  `selfHeal: false`.
+- Dependency fixed **after** it: both arms sat `OutOfSync`/`Failed` for 7+ minutes and
+  neither recovered. Both logged `Skipping auto-sync: failed previous sync attempt to
+  [rev] and will not retry for [rev]`.
 
-```yaml
-syncPolicy:
-  automated:
-    selfHeal: true
-```
+So: fix it fast and it heals itself; fix it slowly and you need a **manual sync**
+(works at the same revision) or a new commit. `argocd app terminate-op` does *not*
+help — it only releases an operation that is still `Running`.
 
-A *failed* sync operation blocks auto-sync of that revision exactly as hard as a
-Running one — the controller logs `Skipping auto-sync: failed previous sync attempt
-to [rev] and will not retry for [rev]`. So with `selfHeal: false`, once a gated sync
-has failed, **fixing the dependency changes nothing**: the Gate flips back to `Ready`,
-the Application stays `OutOfSync`, and the workload is never created until a new
-commit lands. With `selfHeal: true` the controller re-initiates and recovers about
-40 seconds after the Gate clears.
-
-Two things that make the wedge hard to spot:
-
-- `argocd app terminate-op` only releases an operation that is still *Running*. Once
-  it has failed there is nothing to terminate; the way out is a manual sync (works at
-  the same revision — measured) or a new commit.
-- **The Application can read `Healthy` while wedged.** Once the dependency is fixed
-  the Gate goes Ready, and if it's the only live resource the rollup follows it — so
-  you see `health=Healthy`, `sync=OutOfSync`, and the gated workload simply absent.
-  Alert on sync status, not health.
+**And a wedged Application can read `Healthy`.** Once the dependency is fixed the Gate
+goes Ready, and if it's the only live resource the health rollup follows it — so you
+see `health=Healthy`, `sync=OutOfSync`, and the gated workload simply absent. Alert on
+sync status, not health.
 
 ### 6. Monitoring — optional but strongly recommended
 
@@ -343,7 +336,7 @@ its dependency recovers.
 | `argocd app sync --prune` | **Does nothing, and looks like it's working.** It builds the same task list as auto-sync, so the wave-`-1` Gate blocks it identically — the operation sits at `Running`, not `Failed`. This is the first thing most people try |
 | `argocd app sync --prune --resource apps:Deployment:<ns>/<name>` | Works — a targeted prune drops the Gate from the task list entirely. But you must disable `automated` and terminate the stuck operation first, and it's imperative drift until the Git removal follows |
 | `kubectl delete` the gated resource | Half-works, then strands you. The resource stays gone, but the Application is left `OutOfSync/Progressing` with an operation pending indefinitely — it looks broken rather than deliberately withdrawn |
-| `kubectl delete` the Gate | **Pointless with `selfHeal: true`.** It's the wave-`-1` task selfHeal applies first, so it's back within seconds — and a freshly created Gate has no status, which the health check reads as `Progressing / "Awaiting first evaluation"`, so it blocks immediately rather than briefly passing |
+| `kubectl delete` the Gate | **Pointless under `automated`.** Argo CD reapplies it within seconds — and a freshly created Gate has no status, which the health check reads as `Progressing / "Awaiting first evaluation"`, so it blocks immediately rather than briefly passing |
 
 ### Confirming it actually gates
 
@@ -423,8 +416,8 @@ gate that couldn't answer, neither of which should fail a sync.
 
 `Degraded` fails the sync operation, which is what makes the problem visible — the
 Application reads `Degraded` and notifications fire, rather than looking like a slow
-deploy indefinitely. **It requires `selfHeal: true`** (step 5), because a failed
-operation blocks auto-sync of that revision.
+deploy indefinitely. The cost is that a failed operation blocks auto-sync of that
+revision once the retry budget is spent — see step 5.
 
 A `Progressing` gate has no such problem: a still-Running operation keeps re-checking
 the wave and proceeds the moment the gate clears, however long that takes. That
@@ -638,8 +631,9 @@ What does change for anyone who had Gates before:
   endpoints no longer exist. Replace each one with the `sync-wave: "-1"` annotation
   on the Gate (see [Using it](#using-it)), and delete the Job along with its
   ServiceAccount, Role and RoleBinding.
-- The two platform prerequisites in steps 3 and 4 above are new. Skipping either
-  leaves Gates that silently gate nothing.
+- **The Argo CD health check in step 3 is new and required.** Without it a Gate
+  gates nothing, silently. Steps 4 and 5 are not prerequisites — they describe how
+  a gated sync behaves, and the defaults are the right starting point.
 
 ## Troubleshooting
 
@@ -673,8 +667,8 @@ opposite: the operation goes `phase=Error` with a parse error and nothing is cre
 `OutOfSync` and nothing deploys.** The previous sync *failed*, and a failed operation
 blocks auto-sync of that revision — `Skipping auto-sync: failed previous sync attempt
 … and will not retry`. `terminate-op` won't help, there is no operation to terminate.
-Set `selfHeal: true` (step 5) so this recovers by itself; to unblock it now, run a
-manual sync or push a commit.
+It self-heals only if you fix the dependency inside the retry budget (~5½ min, see
+step 5); past that, run a manual sync or push a commit.
 
 **A migration ran before its gate.** PreSync hooks are not gated. Hooks run ahead of
 the waves that contain the Gate, so at the moment a PreSync Job starts the Gate may
