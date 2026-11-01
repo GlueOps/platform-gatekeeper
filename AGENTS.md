@@ -66,8 +66,8 @@ kubectl set image deployment/glueops-core-gatekeeper gatekeeper=platform-gatekee
 ```
 
 That gives you a working controller but **not** working gating: Argo CD also needs
-the Lua health check and `--sync-timeout` (Decisions 4 and 5), without which a Gate
-silently gates nothing. To actually exercise a gated wave in that cluster:
+the Lua health check (Decision 4), without which a Gate silently gates nothing. To
+actually exercise a gated wave in that cluster:
 
 ```bash
 kubectl create namespace argocd
@@ -188,9 +188,18 @@ information.
    `examples/argocd-health-check.yaml` a Gate gates nothing. Its `observedGeneration`
    guard is also required: without it an edited Gate is judged against the condition
    left from its previous spec and gets bypassed on the very sync that tightened it.
-5. **`--sync-timeout` must be set cluster-wide.** It defaults to never, and a Running
-   sync operation blocks later auto-syncs of that Application including the fix. This
-   is also what turns a hung wave into a visible failure.
+5. **`--sync-timeout` is optional; `argocd app terminate-op` is the accepted
+   recovery.** It defaults to never, so a gate that never goes ready leaves the
+   operation `Running`, which blocks later auto-syncs of that Application including
+   the fix. Setting it turns that hang into a visible `Failed` instead. The platform
+   team runs without it deliberately — they have used `terminate-op` for this before
+   and are comfortable with the manual step — so don't re-raise it as a prerequisite.
+   It is also controller-wide with no per-Application override, so a value below the
+   longest legitimate sync in the cluster breaks unrelated Applications.
+   **What `terminate-op` does not cover:** an operation that has already *failed*,
+   which is what the `Degraded` reasons in Decision 15 produce. That case needs
+   `selfHeal: true`, a manual sync, or a new commit — see the auto-sync bullet under
+   "Argo CD interactions worth knowing".
 6. **Terminal means the upstream controller has declared it stopped trying** — not
    "this looks unhealthy right now". Only a Job's `Failed=True` and a Flux
    HelmRelease's `Stalled=True` qualify. A declarative `terminalWhen` field was
@@ -253,7 +262,7 @@ information.
     `Degraded` fails the sync operation, and a *failed* operation blocks auto-sync of
     that revision just as hard as a Running one (`Skipping auto-sync: failed previous
     sync attempt to [rev] and will not retry`). So:
-    - With `selfHeal: true`, which the example ships and the README now requires, the
+    - With `selfHeal: true`, which the example ships and the README requires, the
       controller re-initiates after the failure and recovers on its own ~40s after the
       Gate clears. Fine.
     - With `selfHeal: false` it is a wedge that only a new commit or a manual sync
@@ -266,13 +275,18 @@ information.
 
     The `Progressing` path does **not** have this problem, which is the honest cost of
     this decision: while the operation is still Running it keeps re-checking the wave,
-    so a cluster-side fix lands within the `--sync-timeout` window and the sync simply
-    proceeds. `Degraded` trades that grace window for a legible failure — the
-    Application reads `Degraded` and notifications fire, instead of looking like a
-    normal slow deploy for 30 minutes. That trade is only sound *because*
-    `selfHeal: true` is required; if that requirement is ever dropped, revisit this.
-    (An earlier version of this note claimed the two paths reach "the same blocked
-    state" and differ only in timing. They don't.)
+    so a cluster-side fix at any point lets the sync proceed on its own. With
+    `--sync-timeout` left at its default (Decision 5) that grace window is
+    **unbounded**, so `Progressing` is the strictly more forgiving state and this
+    decision gives up more than a bounded window would.
+    What it buys in exchange is the only signal there is. Without a timeout a stuck
+    `Progressing` gate looks like an ordinary slow deploy *forever* and nothing
+    alerts; `Degraded` surfaces it on the Application and fires notifications. So the
+    trade is legibility against self-recovery, and it is sound only while
+    `selfHeal: true` holds — if that is ever dropped, revisit this.
+    (Two earlier versions of this note were wrong: the first claimed both paths reach
+    "the same blocked state" differing only in timing, the second put the window at
+    30 minutes, which assumed a `--sync-timeout` the platform does not set.)
     `InvalidSpec` is near-unreachable in practice (`required` + `minLength: 1` on
     every check field, `required: ["checks"]`, `items: type: object`, and the CEL
     rule block every path that emits it); it is in the table for uniformity, so the

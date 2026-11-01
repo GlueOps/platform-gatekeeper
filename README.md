@@ -197,21 +197,42 @@ produces a sync task, and wave 0 runs immediately — the same silent un-gating 
 missing health check. The only signal is an `ExcludedResourceWarning` condition on
 the Application.
 
-### 4. Set an Argo CD sync timeout — required
+### 4. Consider an Argo CD sync timeout — optional
 
-Set `--sync-timeout` (or `ARGOCD_APPLICATION_CONTROLLER_SYNC_TIMEOUT`) on the
-application controller. It defaults to *never*, so a gate that legitimately never
-becomes ready leaves the sync operation Running indefinitely — and a Running
-operation blocks every later auto-sync of that Application, **including the commit
-that would fix the gate**. Recovery then needs a manual
-`argocd app terminate-op <app>`.
+A gate that never becomes ready leaves the sync operation `Running` indefinitely,
+because `--sync-timeout` defaults to *never*. A Running operation blocks every later
+auto-sync of that Application, including the commit that would fix the gate, until
+someone runs:
 
-This is a controller-wide setting, so pick a value above the longest legitimate gate
-wait in the cluster. **Start at `1800` (30 minutes)** and adjust: a Gate reports Ready
-within one reconcile interval (30s by default) of its dependency coming up, so the
-budget is almost entirely the dependency's own startup — a cold platform-stack
-bootstrap is the long pole, not gatekeeper. Too low fails syncs that would have
-succeeded; too high is the indefinite hang above, slower.
+```bash
+argocd app terminate-op <app>
+```
+
+If your team is comfortable with that recovery, you can leave the default alone —
+this is the state the platform already runs in. Setting a timeout only buys you the
+same outcome without the manual step, by turning the hang into a `Failed` operation
+with `Operation terminated, triggered by controller sync timeout`.
+
+If you do set it:
+
+```bash
+kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge \
+  -p '{"data":{"controller.sync.timeout.seconds":"1800"}}'
+kubectl -n argocd rollout restart statefulset/argocd-application-controller
+```
+
+The restart is required — unlike `argocd-cm`, this ConfigMap is injected as
+environment variables and is only read at pod start. Under the argo-cd Helm chart,
+set it in `configs.params` instead.
+
+`1800` is a starting point: a Gate reports Ready within one reconcile interval (30s)
+of its dependency coming up, so the budget is almost entirely the dependency's own
+startup, and a cold platform-stack bootstrap is the long pole. **It is controller-wide
+and has no per-Application override**, so a value below the longest legitimate sync in
+the cluster — gated or not — will start failing syncs that used to succeed.
+
+Note that `terminate-op` only releases an operation that is still *Running*. It does
+nothing once one has **failed**, which is what a `Degraded` Gate produces (step 5).
 
 ### 5. Use `selfHeal: true` — required for recovery
 
@@ -371,11 +392,13 @@ gate that couldn't answer, neither of which should fail a sync.
 
 `Degraded` fails the sync operation, which is what makes the problem visible — the
 Application reads `Degraded` and notifications fire, rather than looking like a slow
-deploy until `--sync-timeout`. **It requires `selfHeal: true`** (step 5): a failed
-operation blocks auto-sync of that revision, and a `Progressing` gate does *not* have
-that problem, because a still-Running operation keeps re-checking the wave and simply
-proceeds once the gate clears. That grace window is what `Degraded` trades away for
-the clearer signal.
+deploy indefinitely. **It requires `selfHeal: true`** (step 5), because a failed
+operation blocks auto-sync of that revision.
+
+A `Progressing` gate has no such problem: a still-Running operation keeps re-checking
+the wave and proceeds the moment the gate clears, however long that takes. That
+self-recovery is what `Degraded` trades away for the clearer signal — a deliberate
+choice, with the reasoning in [AGENTS.md](AGENTS.md) Decision 15.
 
 Because Argo CD folds resource health into the Application's on a worst-wins basis,
 a waiting Gate shows up as the Application being `Progressing`, and any of the four
