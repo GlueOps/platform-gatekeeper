@@ -17,7 +17,7 @@
 # migration — and from then on every sync of this Application hangs at wave -1 until
 # --sync-timeout, with auto-sync skipped meanwhile, including the commit that would
 # fix it.
-apiVersion: platform.glueops.dev/v1alpha2
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: my-app-dependencies

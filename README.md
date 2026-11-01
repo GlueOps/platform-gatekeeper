@@ -11,7 +11,7 @@ are actually up:
 
 ```yaml
 # gate.yaml — applied in wave -1
-apiVersion: platform.glueops.dev/v1alpha2
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: my-app-dependencies
@@ -87,10 +87,6 @@ today.
 kubectl apply -f crd.yaml
 kubectl apply -f rbac.yaml
 ```
-
-> **Upgrading from `v1alpha1`?** `kubectl apply -f crd.yaml` will be **rejected**,
-> because `v1alpha1` remains in the live CRD's `status.storedVersions`. See
-> [Upgrading](#upgrading-from-v1alpha1) below.
 
 `rbac.yaml`'s ClusterRole is **the ceiling on what any Gate can observe**. A kind
 granted there becomes readable by every Gate (in its own namespace, or an allowlisted
@@ -403,70 +399,24 @@ therefore a privileged grant.
 
 ---
 
-## Upgrading from `v1alpha1`
+## Upgrading from an earlier build
 
-The CRD ships `v1alpha2` only, and `kubectl apply -f crd.yaml` is **rejected** on a
-cluster that already has `v1alpha1`:
+The `Gate` schema changed incompatibly, which is what `v1alpha1` is for — the
+version is unchanged, so `kubectl apply -f crd.yaml` works in place. There is no
+`status.storedVersions` migration and nothing to convert: the apiserver prunes
+removed fields such as `spec.strict` from Gates already in the cluster.
 
-```
-status.storedVersions[0]: Invalid value: "v1alpha1": missing from spec.versions
-```
+What does change for anyone who had Gates before:
 
-In GitOps this is a hard Argo CD sync failure, and the obvious workaround
-(`kubectl delete crd`) cascade-deletes every Gate in the cluster.
-
-`spec.strict` was also removed, so existing Gates must drop it.
-
-**If you have no Gates worth keeping** (nothing in production), the short path is
-fine — note it deletes all Gate objects:
-
-```bash
-kubectl get gates -A -o yaml > gates-backup.yaml   # somewhere durable and private;
-                                                   # it contains tenant namespace names
-kubectl delete crd gates.platform.glueops.dev
-kubectl wait --for=delete crd/gates.platform.glueops.dev --timeout=60s
-kubectl apply -f crd.yaml
-# re-apply Gates with spec.strict removed and a sync-wave annotation added
-```
-
-**Otherwise, migrate the stored version without deleting anything:**
-
-1. Apply a CRD listing *both* versions with `v1alpha2` as the storage version. The
-   repo doesn't ship a `v1alpha1` schema, but it doesn't need to be a real one — a
-   stub is enough to satisfy the check:
-
-   ```yaml
-   - name: v1alpha1
-     served: false
-     storage: false
-     schema:
-       openAPIV3Schema:
-         type: object
-         x-kubernetes-preserve-unknown-fields: true
-   ```
-
-2. Rewrite every Gate so it re-persists at the new version:
-   `kubectl get gates -A -o json | kubectl replace -f -`
-3. Drop the old version from the CRD's `status.storedVersions`. **The
-   `--subresource=status` flag is required** — without it the `status` key is
-   silently discarded and step 4 fails with the same error:
-
-   ```bash
-   kubectl patch crd gates.platform.glueops.dev --subresource=status \
-     --type merge -p '{"status":{"storedVersions":["v1alpha2"]}}'
-   ```
-
-4. Now apply the `v1alpha2`-only `crd.yaml`.
-
-Either way, merge the tenant-side Git changes (dropping `spec.strict`, adding the
-wave annotation) **before** the CRD swap, or pause auto-sync for the window —
-otherwise Argo CD re-applies old-shape Gates that the new CRD rejects.
-
-Expect a short window after the swap where Gates have no `status.conditions` until
-the first sweep. The Lua check reports `Progressing` for that, so gated waves hold
-rather than racing ahead — bounded by `--sync-timeout`.
-
----
+- **`spec.strict` is gone.** Old manifests are rejected with an unknown-field error
+  by any client using strict field validation, which includes `kubectl` by default
+  and Argo CD's server-side apply. Delete the field.
+- **Hook Jobs that called `/check` or `/explain` will fail**, because those
+  endpoints no longer exist. Replace each one with the `sync-wave: "-1"` annotation
+  on the Gate (see [Using it](#using-it)), and delete the Job along with its
+  ServiceAccount, Role and RoleBinding.
+- The two platform prerequisites in steps 3 and 4 above are new. Skipping either
+  leaves Gates that silently gate nothing.
 
 ## Troubleshooting
 

@@ -6,7 +6,7 @@
 #
 # Note the Gate must live in the same Argo CD Application as the workloads it gates
 # -- sync waves only order resources within one Application.
-apiVersion: platform.glueops.dev/v1alpha2
+apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: observability-stack-complete

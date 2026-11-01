@@ -5,7 +5,7 @@ Guidance for AI coding assistants working in this repository.
 ## What this is
 
 **GlueOps Core Gatekeeper** — a small Kubernetes controller that evaluates `Gate`
-custom resources (`platform.glueops.dev/v1alpha2`) and publishes dependency
+custom resources (`platform.glueops.dev/v1alpha1`) and publishes dependency
 readiness to `Gate.status`. Argo CD reads that status as resource health, so a sync
 wave can hold a rollout until the dependencies are up.
 
@@ -56,8 +56,10 @@ That gives you a working controller but **not** working gating: Argo CD also nee
 the Lua health check and `--sync-timeout` (Decisions 4 and 5), without which a Gate
 silently gates nothing. See README's Install section.
 
-Note `kubectl apply -f crd.yaml` fails on a cluster that already has `v1alpha1`
-installed — see README's Upgrading section.
+The CRD schema changed incompatibly without a version bump, which `v1alpha1`
+permits. Applying it over an older install works in place: the version never
+leaves `spec.versions`, so there is no `status.storedVersions` migration, and the
+apiserver prunes removed fields such as `spec.strict` from stored Gates.
 
 ## How evaluation is structured
 
@@ -128,7 +130,7 @@ information.
 
 1. **Published status, not a request API.** The HTTP `/check` and `/explain`
    endpoints, TokenReview authentication and per-caller SubjectAccessReview were all
-   removed in `v1alpha2`. The driver was consumer ergonomics: the old design required
+   removed in this change. The driver was consumer ergonomics: the old design required
    a PreSync hook Job plus a ServiceAccount, Role and RoleBinding per app, each
    carrying a copy of a shell retry loop.
 2. **Accepted: readiness can be stale.** A gatekeeper that is down leaves Gates at

@@ -809,13 +809,13 @@ func TestBoolOr(t *testing.T) {
 
 var testGateGVR = schema.GroupVersionResource{
 	Group:    "platform.glueops.dev",
-	Version:  "v1alpha2",
+	Version:  "v1alpha1",
 	Resource: "gates",
 }
 
 func testGate(ns, name string, generation int64, checks ...any) *unstructured.Unstructured {
 	return &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "platform.glueops.dev/v1alpha2",
+		"apiVersion": "platform.glueops.dev/v1alpha1",
 		"kind":       "Gate",
 		"metadata": map[string]any{
 			"name":       name,

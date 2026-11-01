@@ -60,7 +60,7 @@ const (
 // different CRD, which means a different crd.yaml and ClusterRole.
 var gateGVR = schema.GroupVersionResource{
 	Group:    "platform.glueops.dev",
-	Version:  "v1alpha2",
+	Version:  "v1alpha1",
 	Resource: "gates",
 }
 
@@ -68,7 +68,6 @@ type Server struct {
 	kube kubernetes.Interface
 	dyn  dynamic.Interface
 
-	// Gate CRD location (configurable)
 	gateGVR schema.GroupVersionResource
 
 	// platform-mode cross-namespace allowlist
