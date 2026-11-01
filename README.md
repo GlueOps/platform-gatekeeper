@@ -100,7 +100,9 @@ kubectl apply -f deploy.yaml
 ```
 
 Set the image to a released tag pinned by digest and review the allowlist env vars
-first.
+first. **It must be v2.0.0 or later** — v1.x is the request-API build, which serves
+`/check` and never writes `Gate.status`, so Gates would sit with no condition and
+every gated Application would hang at wave `-1`.
 
 ### 3. Teach Argo CD to read a Gate — required
 
@@ -108,23 +110,55 @@ Argo CD has no built-in health check for a `Gate`, so you give it one. This is t
 whole script — it maps the `Ready` condition onto Argo CD's health vocabulary:
 
 ```lua
+-- Reasons no amount of waiting can clear: each needs someone to change something
+-- -- the Gate's spec, the namespace's mode label, gatekeeper's ClusterRole or
+-- allowlist, or the stuck dependency itself. EvaluationFailed and
+-- DependenciesNotReady are deliberately absent.
+local stuck = {
+  Terminal = true,
+  PolicyViolation = true,
+  ReadForbidden = true,
+  InvalidSpec = true,
+}
 hs = {}
 if obj.status == nil or obj.status.conditions == nil then
-  hs.status = "Progressing"; hs.message = "Awaiting first evaluation"; return hs
-end
--- An edited Gate must not be judged against its previous spec's condition.
-if obj.metadata.generation ~= nil and obj.status.observedGeneration ~= obj.metadata.generation then
-  hs.status = "Progressing"; hs.message = "Awaiting evaluation of current spec"; return hs
+  hs.status = "Progressing"
+  hs.message = "Awaiting first evaluation"
+  return hs
 end
 for i, c in ipairs(obj.status.conditions) do
   if c.type == "Ready" then
+    -- metav1 binds observedGeneration to the condition it was set from, so the
+    -- condition's own field ties currency to the very condition about to be
+    -- trusted; the status-level one is a fallback for writers that set only that.
+    local observed = c.observedGeneration or obj.status.observedGeneration
+    local generation = obj.metadata and obj.metadata.generation
+    if generation == nil or observed ~= generation then
+      hs.status = "Progressing"
+      hs.message = "Awaiting evaluation of current spec"
+      return hs
+    end
     hs.message = (c.reason or "") .. ": " .. (c.message or "")
-    if c.status == "True" then hs.status = "Healthy"; return hs end
-    if c.reason == "Terminal" then hs.status = "Degraded"; return hs end
-    hs.status = "Progressing"; return hs
+    if c.status == "True" then
+      hs.status = "Healthy"
+      return hs
+    end
+    -- Degraded fails the operation rather than waiting. It needs selfHeal: true
+    -- to recover afterwards -- see AGENTS.md Decision 15, which records what this
+    -- was measured to do.
+    if stuck[c.reason] then
+      hs.status = "Degraded"
+      return hs
+    end
+    -- Everything else, including Unknown, means keep waiting. An unevaluable
+    -- gate makes no claim about the dependency, so Degraded would be wrong.
+    hs.status = "Progressing"
+    return hs
   end
 end
-hs.status = "Progressing"; hs.message = "No Ready condition"; return hs
+hs.status = "Progressing"
+hs.message = "No Ready condition"
+return hs
 ```
 
 **If `argocd-cm` is managed by the argo-cd Helm chart** (the common case), put it in
@@ -173,9 +207,41 @@ that would fix the gate**. Recovery then needs a manual
 `argocd app terminate-op <app>`.
 
 This is a controller-wide setting, so pick a value above the longest legitimate gate
-wait in the cluster.
+wait in the cluster. **Start at `1800` (30 minutes)** and adjust: a Gate reports Ready
+within one reconcile interval (30s by default) of its dependency coming up, so the
+budget is almost entirely the dependency's own startup — a cold platform-stack
+bootstrap is the long pole, not gatekeeper. Too low fails syncs that would have
+succeeded; too high is the indefinite hang above, slower.
 
-### 5. Monitoring — optional but strongly recommended
+### 5. Use `selfHeal: true` — required for recovery
+
+If your Applications use `syncPolicy.automated`, they need `selfHeal: true`:
+
+```yaml
+syncPolicy:
+  automated:
+    selfHeal: true
+```
+
+A *failed* sync operation blocks auto-sync of that revision exactly as hard as a
+Running one — the controller logs `Skipping auto-sync: failed previous sync attempt
+to [rev] and will not retry for [rev]`. So with `selfHeal: false`, once a gated sync
+has failed, **fixing the dependency changes nothing**: the Gate flips back to `Ready`,
+the Application stays `OutOfSync`, and the workload is never created until a new
+commit lands. With `selfHeal: true` the controller re-initiates and recovers about
+40 seconds after the Gate clears.
+
+Two things that make the wedge hard to spot:
+
+- `argocd app terminate-op` only releases an operation that is still *Running*. Once
+  it has failed there is nothing to terminate; the way out is a manual sync (works at
+  the same revision — measured) or a new commit.
+- **The Application can read `Healthy` while wedged.** Once the dependency is fixed
+  the Gate goes Ready, and if it's the only live resource the rollup follows it — so
+  you see `health=Healthy`, `sync=OutOfSync`, and the gated workload simply absent.
+  Alert on sync status, not health.
+
+### 6. Monitoring — optional but strongly recommended
 
 ```bash
 kubectl apply -f servicemonitor.yaml   # needs the Prometheus Operator
@@ -209,7 +275,7 @@ prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*gatekeepe
 Start from [`examples/wave-gating/`](examples/wave-gating) — an Application with a
 Gate in wave `-1` and a Deployment in the default wave.
 
-Two rules that are easy to get wrong:
+Four rules that are easy to get wrong:
 
 - **Wave `-1`, not `0`.** The default wave *is* `0`, so a Gate at `0` shares a wave
   with un-annotated resources and orders nothing.
@@ -218,6 +284,14 @@ Two rules that are easy to get wrong:
   Job running `kubectl wait --for=condition=Ready gate/x` works, but only if the
   Gate already exists — PreSync runs before manifests are applied, so a Gate shipped
   alongside the workloads won't exist yet and the wait will fail immediately.
+- **Not a PreSync hook.** Hooks are not gated at all: they run ahead of the waves
+  that contain the Gate, so a PreSync Job can be `Running` before the Gate even
+  exists. A migration — the thing you would most want gated — must go in a wave
+  after the Gate, not a hook.
+- **A blocked Gate also blocks `prune`.** With `prune: true`, removing a resource
+  from Git while the Gate is `False` pins the operation on the Gate's health and the
+  prune never runs, so you can't withdraw a gated resource while its dependency is
+  down.
 
 ### Confirming it actually gates
 
@@ -279,31 +353,44 @@ $ kubectl get gate my-app-dependencies -n nonprod -o jsonpath='{.status.results}
 
 `REASON` separates the cases that need different responses:
 
-| Reason | Status | Meaning |
-| --- | --- | --- |
-| `Ready` | True | every check passed |
-| `DependenciesNotReady` | False | still waiting; expected to resolve on its own |
-| `Terminal` | False | the upstream controller has given up — a failed Job, a stalled HelmRelease. It will not recover without a change, so stop waiting |
-| `PolicyViolation` | False | the Gate references a namespace it isn't allowed to read |
-| `ReadForbidden` | False | gatekeeper's ClusterRole is missing a kind; the message names what to grant |
-| `InvalidSpec` | False | the Gate itself is malformed |
-| `EvaluationFailed` | Unknown | gatekeeper couldn't evaluate a check, so it makes no claim either way |
+| Reason | Status | Argo CD health | Meaning |
+| --- | --- | --- | --- |
+| `Ready` | True | Healthy | every check passed |
+| `DependenciesNotReady` | False | Progressing | still waiting; expected to resolve on its own |
+| `EvaluationFailed` | Unknown | Progressing | gatekeeper couldn't evaluate a check, so it makes no claim either way |
+| `Terminal` | False | **Degraded** | the upstream controller has given up — a failed Job, a stalled HelmRelease |
+| `PolicyViolation` | False | **Degraded** | the Gate references a namespace it isn't allowed to read |
+| `ReadForbidden` | False | **Degraded** | gatekeeper's ClusterRole is missing a kind; the message names what to grant |
+| `InvalidSpec` | False | **Degraded** | the Gate itself is malformed |
 
-`Terminal` surfaces in Argo CD as `Degraded`, which fails the sync operation promptly
-instead of waiting out the timeout. Everything else that isn't ready reads as
-`Progressing`.
+The four `Degraded` reasons are the ones that **cannot clear on their own** — each
+needs someone to change something: the Gate's spec, the namespace's mode label,
+gatekeeper's ClusterRole or allowlist, or the stuck dependency itself (deleting a
+failed Job so it re-runs). The two `Progressing` ones are a gate doing its job and a
+gate that couldn't answer, neither of which should fail a sync.
+
+`Degraded` fails the sync operation, which is what makes the problem visible — the
+Application reads `Degraded` and notifications fire, rather than looking like a slow
+deploy until `--sync-timeout`. **It requires `selfHeal: true`** (step 5): a failed
+operation blocks auto-sync of that revision, and a `Progressing` gate does *not* have
+that problem, because a still-Running operation keeps re-checking the wave and simply
+proceeds once the gate clears. That grace window is what `Degraded` trades away for
+the clearer signal.
 
 Because Argo CD folds resource health into the Application's on a worst-wins basis,
-a blocked Gate shows up as the Application being `Progressing`, and a *terminal* one
-as `Degraded`. Annotating a Gate `argocd.argoproj.io/ignore-healthcheck: "true"`
-removes it from that rollup while leaving wave gating intact (the sync engine reads
-the Gate's health directly and ignores the annotation).
+a waiting Gate shows up as the Application being `Progressing`, and any of the four
+`Degraded` reasons above as `Degraded`. Annotating a Gate
+`argocd.argoproj.io/ignore-healthcheck: "true"` removes it from that rollup while
+leaving wave gating intact (the sync engine reads the Gate's health directly and
+ignores the annotation).
 
 The shipped example deliberately does **not** set it. Measured against the same
 blocked Gate: without the annotation the Application reads `Progressing`, with it
 the Application reads `Healthy` — i.e. healthy while its declared dependency is
-down. Reach for it only if a terminal Gate left in place after a rollout keeping the
-Application `Degraded` is worse for you than that.
+down. Reach for it only if a `Degraded` Gate left in place keeping the Application
+`Degraded` is worse for you than that. In practice the reason most likely to park an
+Application there is `ReadForbidden` — a kind missing from gatekeeper's ClusterRole —
+not a failed Job.
 
 Note that `LAST-TRANSITION` is the last time the condition *changed*, not the last
 time it was evaluated — so it cannot tell you whether gatekeeper is still running.
@@ -518,13 +605,27 @@ transient API error. The condition is `Unknown` rather than `False` on purpose: 
 not a claim that the dependency is unready.
 
 **A sync hangs and the Gate looks healthy.** Check that the Lua health check from
-step 3 is actually installed; without it Argo CD ignores the Gate entirely. A *syntax
-error* in that script yields health `Unknown`, which the sync loop silently ignores
-while the wave hangs — so test changes against a real Gate first.
+step 3 is actually installed; without it Argo CD ignores the Gate entirely, the wave
+task succeeds immediately, and the rollout proceeds ungated with *no* warning
+anywhere — the Gate simply reports empty health and the Application reads Healthy.
+This is the quietest way to break gating. A *syntax error* in the script is the
+opposite: the operation goes `phase=Error` with a parse error and nothing is created.
 
 **A sync is stuck Running and won't pick up new commits.** That's the
 `--sync-timeout` default from step 4. Release it with
 `argocd app terminate-op <app>`.
+
+**The dependency is fixed, the Gate reads `Ready`, but the Application stays
+`OutOfSync` and nothing deploys.** The previous sync *failed*, and a failed operation
+blocks auto-sync of that revision — `Skipping auto-sync: failed previous sync attempt
+… and will not retry`. `terminate-op` won't help, there is no operation to terminate.
+Set `selfHeal: true` (step 5) so this recovers by itself; to unblock it now, run a
+manual sync or push a commit.
+
+**A migration ran before its gate.** PreSync hooks are not gated. Hooks run ahead of
+the waves that contain the Gate, so at the moment a PreSync Job starts the Gate may
+not even exist yet. Move the work into a wave after the Gate instead of a PreSync
+hook.
 
 **Is gatekeeper actually running?** Not answerable from `kubectl get gates` —
 `LAST-TRANSITION` is deliberately inherited, so a Gate that has been Ready for days
@@ -560,6 +661,9 @@ docker run --rm -v "$PWD":/w -w /w golang:1.26 go test -race ./...
 # container image
 docker build -t gatekeeper .
 ```
+
+Two more suites live in `examples/argocd-health-check_test.lua` and
+`prometheusrule_test.yaml`; CI runs all three, and each file's header has its commands.
 
 To run it against a cluster, point `KUBECONFIG` at one and see `.env.example`.
 End-to-end instructions, including a throwaway k3d cluster, are in

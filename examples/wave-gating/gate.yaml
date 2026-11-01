@@ -36,9 +36,10 @@ metadata:
     # directly and ignores the annotation — so the only thing it buys is hiding gate
     # state from the Application, which is the wrong default.
     #
-    # Set it only if a *terminal* Gate (a failed Job, a stalled HelmRelease) left in
-    # place after a rollout keeping the Application Degraded is worse for you than
-    # an Application that reads Healthy while its dependency is broken.
+    # Set it only if a Gate stuck on a Degraded reason (most often ReadForbidden --
+    # a kind missing from gatekeeper's ClusterRole) keeping the Application Degraded
+    # is worse for you than an Application that reads Healthy while its dependency
+    # is broken.
 spec:
   checks:
     - id: database

@@ -19,4 +19,7 @@ spec:
   syncPolicy:
     automated:
       prune: true
+      # selfHeal is required, not a preference: a failed sync blocks auto-sync of
+      # that revision, so without it a gated sync that fails once never retries --
+      # fixing the dependency leaves the Application OutOfSync until a new commit.
       selfHeal: true

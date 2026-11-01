@@ -44,6 +44,18 @@ docker run --rm -v "$PWD":/w -w /w golang:1.26-alpine sh -c 'go build ./... && g
 docker run --rm -v "$PWD":/w -w /w golang:1.26 go test -race ./...
 ```
 
+**`go test` is one of three suites.** The other two guard files that fail silently —
+a broken Lua health check hangs waves showing `Unknown`, a broken alert expression
+simply never fires. CI runs all three (`.github/workflows/ci.yaml`), but run the
+relevant one locally too when you touch the file it covers. Both live inside YAML and
+need extracting first; the exact commands are in each test's own header, kept there
+rather than duplicated here:
+
+| Touching | Run |
+| --- | --- |
+| `examples/argocd-health-check.yaml` | `examples/argocd-health-check_test.lua` — under 5.1 *and* 5.4 |
+| `prometheusrule.yaml` | `prometheusrule_test.yaml` (promtool) |
+
 End-to-end against a throwaway cluster:
 
 ```bash
@@ -55,7 +67,28 @@ kubectl set image deployment/glueops-core-gatekeeper gatekeeper=platform-gatekee
 
 That gives you a working controller but **not** working gating: Argo CD also needs
 the Lua health check and `--sync-timeout` (Decisions 4 and 5), without which a Gate
-silently gates nothing. See README's Install section.
+silently gates nothing. To actually exercise a gated wave in that cluster:
+
+```bash
+kubectl create namespace argocd
+# --server-side: the ApplicationSet CRD is too large for client-side apply
+kubectl apply -n argocd --server-side --force-conflicts \
+  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+kubectl patch configmap argocd-cm -n argocd --type merge \
+  --patch-file examples/argocd-health-check.yaml
+kubectl -n argocd rollout status statefulset/argocd-application-controller
+```
+
+Then point an Application at a copy of `examples/wave-gating/` in a repo you control
+(the shipped `repoURL` is a placeholder) with its dependency scaled to 0, and confirm
+the sync holds at wave `-1`.
+
+Two things make a gating test silently measure nothing, both of which cost real time
+here: `argocd.argoproj.io/ignore-healthcheck` left on the Gate, and the `:latest` tag
+in `deploy.yaml` — the apiserver defaults `imagePullPolicy` to `Always` for a floating
+tag and the policy stays in the pod spec afterwards, so a later `kubectl set image` to
+a locally imported tag still tries to pull from the registry and fails. Patch the
+policy to `IfNotPresent` when testing imported builds.
 
 The CRD schema changed incompatibly without a version bump, which `v1alpha1`
 permits. Applying it over an older install works in place: the version never
@@ -160,10 +193,10 @@ information.
    is also what turns a hung wave into a visible failure.
 6. **Terminal means the upstream controller has declared it stopped trying** — not
    "this looks unhealthy right now". Only a Job's `Failed=True` and a Flux
-   HelmRelease's `Stalled=True` qualify; they surface as `reason: Terminal` → Argo CD
-   `Degraded` → prompt sync failure instead of waiting out `--sync-timeout`. A
-   declarative `terminalWhen` field was rejected: it pushes per-technology trivia into
-   tenant YAML and can't express the Job case at all.
+   HelmRelease's `Stalled=True` qualify. A declarative `terminalWhen` field was
+   rejected: it pushes per-technology trivia into tenant YAML and can't express the
+   Job case at all. This definition scopes the per-check `terminal` flag only; which
+   *reasons* read `Degraded` is Decision 15.
    **Argo CD health values are deliberately never terminal.** Health is a rollup over
    an Application's resources: `Degraded` and `Progressing` both occur mid-rollout,
    and `Missing` is the normal state of an Application whose resources aren't live
@@ -209,6 +242,41 @@ information.
 14. **Rejected: configurable Gate GVR.** `GATEKEEPER_GATE_{GROUP,VERSION,RESOURCE}`
     were removed. A different group or plural means a different CRD, hence a different
     `crd.yaml` and ClusterRole, so the knob served a scenario that can't occur.
+15. **Four reasons read `Degraded`, the rest `Progressing`.** The health check's
+    `stuck` table holds `Terminal`, `PolicyViolation`, `ReadForbidden` and
+    `InvalidSpec` — every one a verdict that the Gate needs an edit to its spec, to
+    the namespace's mode label, or to gatekeeper's ClusterRole. `EvaluationFailed`
+    (a read failed, so no claim is made about the dependency) and
+    `DependenciesNotReady` (the normal waiting state) must stay `Progressing`;
+    `TestHealthCheckScriptMatchesTheReasonContract` enforces both halves.
+    **What this costs, measured rather than assumed — and it is not free.**
+    `Degraded` fails the sync operation, and a *failed* operation blocks auto-sync of
+    that revision just as hard as a Running one (`Skipping auto-sync: failed previous
+    sync attempt to [rev] and will not retry`). So:
+    - With `selfHeal: true`, which the example ships and the README now requires, the
+      controller re-initiates after the failure and recovers on its own ~40s after the
+      Gate clears. Fine.
+    - With `selfHeal: false` it is a wedge that only a new commit or a manual sync
+      clears — and **three of the four are fixed cluster-side with no commit**, so the
+      remediation itself cannot release it: `ReadForbidden` (add a kind to the
+      ClusterRole), `PolicyViolation` (relabel the namespace, or change gatekeeper's
+      allowlist env vars) and `Terminal` (delete the failed Job so it re-runs). Only
+      `InvalidSpec` is fixed by a commit, and it is the near-unreachable one.
+      `Terminal` is both the most common and the one that predates this change.
+
+    The `Progressing` path does **not** have this problem, which is the honest cost of
+    this decision: while the operation is still Running it keeps re-checking the wave,
+    so a cluster-side fix lands within the `--sync-timeout` window and the sync simply
+    proceeds. `Degraded` trades that grace window for a legible failure — the
+    Application reads `Degraded` and notifications fire, instead of looking like a
+    normal slow deploy for 30 minutes. That trade is only sound *because*
+    `selfHeal: true` is required; if that requirement is ever dropped, revisit this.
+    (An earlier version of this note claimed the two paths reach "the same blocked
+    state" and differ only in timing. They don't.)
+    `InvalidSpec` is near-unreachable in practice (`required` + `minLength: 1` on
+    every check field, `required: ["checks"]`, `items: type: object`, and the CEL
+    rule block every path that emits it); it is in the table for uniformity, so the
+    rule reads as one sentence rather than a list of exceptions.
 
 ## Ownership
 
@@ -225,18 +293,60 @@ Verified against upstream, and easy to get wrong:
   annotation) — but measured against the same blocked Gate, the Application reads
   `Progressing` without it and `Healthy` with it. An Application reporting Healthy
   while its declared dependency is down is the worse default. It remains the opt-out
-  for teams where a terminal Gate left in place keeping the Application `Degraded`
-  matters more.
+  for teams where a `Degraded` Gate left in place keeping the Application `Degraded`
+  matters more — most often one reporting `ReadForbidden`, not a failed Job.
+- **`automated` auto-sync needs `selfHeal: true` to recover from a gate failure, and
+  nothing warns you.** Measured: a *failed* sync operation blocks auto-sync of that
+  revision exactly as hard as a Running one — `Skipping auto-sync: failed previous
+  sync attempt to [rev] and will not retry for [rev]`. With `selfHeal: false`, fixing
+  the dependency does nothing: the Gate goes `True`, the Application stays `OutOfSync`
+  and the workload is never created until a *new commit* lands. With `selfHeal: true`
+  the controller re-initiates and recovers about 40s after the Gate clears. The
+  shipped example sets it; a team that turns it off loses gate recovery entirely.
+- **A wedged Application can read `Healthy`.** Measured: after the dependency was
+  fixed, the Application showed `health=Healthy` with `sync=OutOfSync` and the gated
+  Deployment absent — the Gate was the only live resource, so the rollup followed it.
+  Anything alerting on Application *health* rather than sync status sees nothing.
+- **`argocd app terminate-op` only helps a *Running* operation.** It does nothing once
+  the operation has already failed, which is the state a `Degraded` Gate produces.
+  Recovery there is a new commit or a manual sync.
+- **PreSync hooks are never gated.** Measured: a PreSync Job was already `Running`
+  while the Gate did not yet exist. Hooks run before the waves that contain the Gate,
+  so a migration Job — the one workload Decision 2 names as the dangerous
+  irreversible case — is completely ungated. Don't put anything in a PreSync hook
+  that a Gate is supposed to protect.
+- **A blocked Gate also blocks deletion.** With `prune: true`, removing a resource
+  from Git pins the operation on the Gate's health and the prune never runs, so a
+  gated resource can't be withdrawn while its dependency is down.
 - **`resource.exclusions` matching `gates` silently un-gates everything.** An
   excluded Gate is stripped from the target objects, so it is never applied, never
   produces a sync task, and the next wave runs immediately. The only signal is an
   `ExcludedResourceWarning` condition.
+- **Removing the health-check key from `argocd-cm` un-gates with *zero* signal.**
+  Measured: the sync `Succeeded`, the workload was created, the dependency was absent,
+  and the Gate's `health.status` was simply empty with the Application reading
+  Healthy. This is the quietest way to break gating, and unlike `resource.exclusions`
+  it leaves no condition behind.
 - **Wave gating is edge-triggered.** Once a wave is observed healthy Argo CD advances
   and does not recheck, so a single Unknown→True→Unknown flap releases the next wave
   for that sync.
-- **A Lua error yields health `Unknown`**, which the sync loop ignores — the wave
-  hangs with the Application showing Unknown rather than Degraded, and nothing
-  alerts. So `examples/argocd-health-check_test.lua` covers all eleven branches,
-  including the generation guard and `Terminal` → `Degraded`; run it before changing
-  the script. Mutation-checked: removing the generation guard makes the stale-`True`
-  case return `Healthy`, which is the bypass it exists to prevent.
+- **A Lua *syntax* error is loud, not silent.** Measured: the operation goes
+  `phase=Error` with a `parse error` message, the workload is not created, and the
+  health rollup stays poisoned until a hard refresh. That is better than the hazard
+  originally assumed here — a runtime error on an unexpected object shape is the one
+  that yields health `Unknown`, which the sync loop ignores while the wave hangs with
+  nothing alerting. So `examples/argocd-health-check_test.lua` covers every branch of
+  the script, the generation guard in both directions, and every reason in and out of
+  the `stuck` table; run it before changing the script. (No counts here on purpose —
+  "eleven branches" and then "sixteen cases" both rotted within a day, and nothing
+  enforces a number in prose.) Mutation-checked: removing the generation guard makes the stale-`True`
+  case return `Healthy`, which is the bypass it exists to prevent, and deleting the
+  message-assembly line changes no status at all — which is why the cases carrying a
+  condition assert the message too.
+- **Argo CD's Lua is gopher-lua, a 5.1 dialect, sandboxed with `SkipOpenLibs`** and
+  only package/base/table loaded. So the script may use nothing beyond `ipairs` and
+  `..` — no `string` library — and no 5.2+ syntax. The suite compiles the script with
+  `loadstring or load` so it runs under a 5.1 interpreter, which is what catches the
+  syntax half of that; run it under `nickblah/lua:5.1-alpine` as well as 5.4. The
+  harness itself is more permissive than Argo CD (it has the string metatable), so a
+  case that indexes a non-table would pass locally and error in production.

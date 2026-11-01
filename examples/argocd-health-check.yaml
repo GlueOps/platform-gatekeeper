@@ -21,36 +21,51 @@
 # the wave task is marked succeeded immediately and the next wave proceeds ungated.
 # Without this script, Gates do nothing.
 #
-# Editing argocd-cm needs no restart, but it does trigger a full re-list, and a
-# syntax error here yields health Unknown, which the sync loop silently ignores while
-# the wave hangs. Test changes against a real Gate object first.
+# Editing argocd-cm needs no restart, but it does trigger a full re-list. A syntax
+# error here is loud — the operation goes phase=Error with a parse error and nothing
+# is created. What's quiet is *removing* this key: the sync then succeeds, the
+# workload is created, and the Application reads Healthy with the dependency down.
+# Either way, test changes against a real Gate object first — and run
+# argocd-health-check_test.lua, which CI runs too.
 data:
   resource.customizations.health.platform.glueops.dev_Gate: |
+    -- Reasons no amount of waiting can clear: each needs someone to change something
+    -- -- the Gate's spec, the namespace's mode label, gatekeeper's ClusterRole or
+    -- allowlist, or the stuck dependency itself. EvaluationFailed and
+    -- DependenciesNotReady are deliberately absent.
+    local stuck = {
+      Terminal = true,
+      PolicyViolation = true,
+      ReadForbidden = true,
+      InvalidSpec = true,
+    }
     hs = {}
     if obj.status == nil or obj.status.conditions == nil then
       hs.status = "Progressing"
       hs.message = "Awaiting first evaluation"
       return hs
     end
-    -- Required, not defensive: without this an edited Gate is judged against the
-    -- condition left over from its previous spec, so Argo CD sees Healthy and
-    -- proceeds, bypassing the gate on the very sync that tightened it.
-    if obj.metadata.generation ~= nil and obj.status.observedGeneration ~= obj.metadata.generation then
-      hs.status = "Progressing"
-      hs.message = "Awaiting evaluation of current spec"
-      return hs
-    end
     for i, c in ipairs(obj.status.conditions) do
       if c.type == "Ready" then
+        -- metav1 binds observedGeneration to the condition it was set from, so the
+        -- condition's own field ties currency to the very condition about to be
+        -- trusted; the status-level one is a fallback for writers that set only that.
+        local observed = c.observedGeneration or obj.status.observedGeneration
+        local generation = obj.metadata and obj.metadata.generation
+        if generation == nil or observed ~= generation then
+          hs.status = "Progressing"
+          hs.message = "Awaiting evaluation of current spec"
+          return hs
+        end
         hs.message = (c.reason or "") .. ": " .. (c.message or "")
         if c.status == "True" then
           hs.status = "Healthy"
           return hs
         end
-        -- Terminal means the upstream controller has declared it stopped trying (a
-        -- failed Job, a stalled HelmRelease). Degraded fails the sync operation
-        -- promptly instead of waiting out --sync-timeout.
-        if c.reason == "Terminal" then
+        -- Degraded fails the operation rather than waiting. It needs selfHeal: true
+        -- to recover afterwards -- see AGENTS.md Decision 15, which records what this
+        -- was measured to do.
+        if stuck[c.reason] then
           hs.status = "Degraded"
           return hs
         end

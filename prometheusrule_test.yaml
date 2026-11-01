@@ -5,14 +5,18 @@
 # naive `absent(up{...})` plus a `time() - gauge` arm are both false. These tests
 # pin that behaviour, and the thresholds.
 #
-# Run them (promtool wants bare rule groups, not the PrometheusRule wrapper):
+# Run them from the repo root (promtool wants bare rule groups, not the PrometheusRule
+# wrapper). Same commands .github/workflows/ci.yaml runs, minus the digest pins:
 #
-#   mkdir -p .pc && cp prometheusrule_test.yaml .pc/test.yaml
-#   docker run --rm -v "$PWD":/w -w /w python:3.12-alpine sh -c \
-#     'pip install -q pyyaml && python -c "import yaml;yaml.safe_dump(yaml.safe_load(open(\"prometheusrule.yaml\"))[\"spec\"],open(\".pc/rules.yaml\",\"w\"))"'
-#   docker run --rm -v "$PWD/.pc":/t -w /t --entrypoint promtool \
-#     prom/prometheus:v3.5.0 test rules test.yaml
-#   rm -rf .pc
+#   mkdir -p .testtmp && cp prometheusrule_test.yaml prometheusrule.yaml .testtmp/
+#   docker run --rm -v "$PWD/.testtmp":/workdir mikefarah/yq:4.47.1 '.spec' \
+#     prometheusrule.yaml > .testtmp/rules.yaml
+#   docker run --rm -v "$PWD/.testtmp":/t -w /t --entrypoint promtool \
+#     prom/prometheus:v3.5.0 test rules prometheusrule_test.yaml
+#   rm -rf .testtmp
+#
+# At least one case must assert a FIRING alert: promtool loads a null or empty rule
+# file without error, so a broken extraction only surfaces as a missing exp_alert.
 #
 # promtool compares the whole annotation set, so each description is spelled out
 # once as a YAML anchor at its first use and aliased afterwards. Keep them in step

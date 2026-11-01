@@ -889,6 +889,11 @@ func readyEndpoints(es *discoveryv1.EndpointSlice) int64 {
 
 // --- status
 
+// writeStatus patches the Ready condition and, unless results is nil, the per-check
+// breakdown. Pass nil ONLY when nothing was evaluated at all: the patch then omits
+// the key and leaves the previously published breakdown in place, because a merge
+// patch replaces arrays wholesale and `results: []` would erase it. Any caller that
+// did evaluate checks must pass what it got, empty slice included.
 func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructured,
 	status metav1.ConditionStatus, reason, message string, results []EvalResult) error {
 
@@ -910,20 +915,25 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 			gate.GetNamespace(), gate.GetName(), orNone(prevStatus), status, reason, message)
 	}
 
-	patch := map[string]any{
-		"status": map[string]any{
+	statusObj := map[string]any{
+		"observedGeneration": gen,
+		"conditions": []any{map[string]any{
+			"type":               conditionReady,
+			"status":             string(status),
+			"reason":             reason,
+			"message":            message,
+			"lastTransitionTime": transition,
 			"observedGeneration": gen,
-			"conditions": []any{map[string]any{
-				"type":               conditionReady,
-				"status":             string(status),
-				"reason":             reason,
-				"message":            message,
-				"lastTransitionTime": transition,
-				"observedGeneration": gen,
-			}},
-			"results": resultsToUnstructured(results),
-		},
+		}},
 	}
+
+	// A merge patch replaces arrays wholesale, so writing `results: []` would erase
+	// the previous breakdown.
+	if results != nil {
+		statusObj["results"] = resultsToUnstructured(results)
+	}
+
+	patch := map[string]any{"status": statusObj}
 
 	b, err := json.Marshal(patch)
 	if err != nil {

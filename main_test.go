@@ -5,6 +5,8 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -1579,6 +1581,156 @@ func TestHandleMetricsExposesTheAlertedSeries(t *testing.T) {
 	}
 }
 
+// The reason strings are a contract with the Lua health check, which compares them
+// as bare literals. Rename one here and terminal Gates quietly stop reading Degraded,
+// so a stalled dependency waits out the whole --sync-timeout instead of failing fast
+// — which is all of Decision 6's value — while both test suites stay green.
+func TestHealthCheckScriptMatchesTheReasonContract(t *testing.T) {
+	script, err := healthCheckScript()
+	if err != nil {
+		t.Fatalf("extracting the script: %v", err)
+	}
+
+	// Match against code only, with comments dropped and spaces removed. Both matter:
+	// the script's prose names the two excluded reasons, so matching raw text makes a
+	// comment reword fail this test while reporting a bug that isn't there — and a
+	// commented-out `Terminal = true` would otherwise satisfy the positive checks.
+	code := stripLuaComments(script)
+	compact := strings.ReplaceAll(code, " ", "")
+
+	// The reason checks are scoped to the table body, so nothing outside it can
+	// satisfy or trip them.
+	_, body, ok := strings.Cut(compact, "localstuck={")
+	if !ok {
+		t.Fatal("the health check has no `local stuck` table — the reason mapping it " +
+			"holds is what decides which Gates fail a sync rather than waiting")
+	}
+	body, _, ok = strings.Cut(body, "}")
+	if !ok {
+		t.Fatal("the health check's `local stuck` table is unterminated")
+	}
+
+	if want := `c.type=="` + conditionReady + `"`; !strings.Contains(compact, want) {
+		t.Errorf("the health check no longer tests the %q condition type — it compares\n"+
+			"the constant as a bare literal, so the two sides have drifted apart",
+			conditionReady)
+	}
+
+	// The script's `stuck` table decides which reasons read Degraded. A reason that
+	// drops out of it silently reverts to waiting out the whole --sync-timeout.
+	for _, reason := range []string{
+		reasonTerminal,
+		reasonPolicyViolation,
+		reasonReadForbidden,
+		reasonInvalidSpec,
+	} {
+		if !strings.Contains(body, reason+"=true") {
+			t.Errorf("%s is missing from the health check's stuck table, so a Gate with\n"+
+				"that reason now waits out --sync-timeout instead of failing", reason)
+		}
+	}
+
+	// And the two that must NOT be in it: a read failure makes no claim about the
+	// dependency, and not-ready is the normal waiting state. Either one landing on
+	// Degraded would fail syncs that were about to succeed.
+	for _, reason := range []string{
+		reasonEvaluationFailed,
+		reasonDependenciesNotReady,
+	} {
+		if strings.Contains(body, reason+"=true") {
+			t.Errorf("%s reads Degraded in the health check, which fails a sync that is\n"+
+				"merely waiting — it must stay Progressing", reason)
+		}
+	}
+}
+
+// README.md shows the health check inline so a reader can see what they are about to
+// paste into argocd-cm. That is a second copy of a load-bearing script, and it went
+// stale within hours of the first edit to the real one, so byte-compare them.
+func TestReadmeShowsTheRealHealthCheck(t *testing.T) {
+	script, err := healthCheckScript()
+	if err != nil {
+		t.Fatalf("extracting the script: %v", err)
+	}
+
+	readme, err := os.ReadFile("README.md")
+	if err != nil {
+		t.Fatalf("reading README.md: %v", err)
+	}
+	_, rest, ok := strings.Cut(string(readme), "```lua\n")
+	if !ok {
+		t.Fatal("README.md has no ```lua block — the health check is no longer shown")
+	}
+	shown, _, ok := strings.Cut(rest, "```")
+	if !ok {
+		t.Fatal("README.md's lua block is unterminated")
+	}
+
+	if shown != script {
+		t.Errorf("README.md's lua block has drifted from\n"+
+			"examples/argocd-health-check.yaml. Re-copy the script.\n\ngot:\n%s\nwant:\n%s",
+			shown, script)
+	}
+}
+
+// stripLuaComments drops `--` to end of line. The script has no `--` inside a string
+// literal, and if one ever appears the result is a loud false failure rather than a
+// silent pass.
+func stripLuaComments(script string) string {
+	var b strings.Builder
+	for _, line := range strings.Split(script, "\n") {
+		if i := strings.Index(line, "--"); i >= 0 {
+			line = line[:i]
+		}
+		b.WriteString(line)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// healthCheckScript returns the Lua out of the ConfigMap patch fragment. Done by hand
+// rather than with a YAML library: the value is a literal block scalar, so dedenting
+// it is exact, and this keeps a parser out of go.mod for one key.
+func healthCheckScript() (string, error) {
+	raw, err := os.ReadFile("examples/argocd-health-check.yaml")
+	if err != nil {
+		return "", err
+	}
+	const key = "  resource.customizations.health.platform.glueops.dev_Gate: |\n"
+	_, rest, ok := strings.Cut(string(raw), key)
+	if !ok {
+		return "", errors.New("the health check key is missing or no longer a literal block scalar")
+	}
+
+	var b strings.Builder
+	blanks := 0
+	for _, line := range strings.SplitAfter(rest, "\n") {
+		switch {
+		// SplitAfter leaves a trailing "" when the script runs to EOF; a blank line
+		// inside the script is "\n", so this only matches that remainder.
+		case line == "":
+			return b.String(), nil
+		// Dedent before testing for blankness, not after: a whitespace-only line
+		// longer than the indent keeps its remaining spaces under `|`, and this
+		// function has to agree with kubectl byte for byte or the comparison it
+		// feeds is asserting against a normalised string instead of the real script.
+		case strings.HasPrefix(line, "    "):
+			b.WriteString(strings.Repeat("\n", blanks))
+			blanks = 0
+			b.WriteString(line[4:])
+		// Held back rather than written: `|` clips trailing line breaks to exactly
+		// one, so blank lines only belong to the value if more content follows.
+		// Emitting them eagerly appends a newline the real value doesn't have, and
+		// the resulting mismatch is invisible in a diff.
+		case strings.TrimSpace(line) == "":
+			blanks++
+		default:
+			return b.String(), nil
+		}
+	}
+	return b.String(), nil
+}
+
 func TestReconcileIntervalFloor(t *testing.T) {
 	tests := []struct {
 		raw  string
@@ -1602,5 +1754,51 @@ func TestReconcileIntervalFloor(t *testing.T) {
 				t.Errorf("reconcileInterval() with %q = %s, want %s", tt.raw, got, tt.want)
 			}
 		})
+	}
+}
+
+// A Gate whose namespace mode can't be resolved reports Unknown, but it must not
+// destroy the per-check breakdown from the last real evaluation — that detail is
+// what an operator reads to find out why it stopped evaluating. The merge patch
+// replaces arrays, so writing an empty one would wipe it.
+func TestNamespaceModeFailurePreservesResults(t *testing.T) {
+	gate := testGate("nonprod", "app", 1, map[string]any{
+		"id":                  "db",
+		"deploymentAvailable": map[string]any{"name": "d"},
+	})
+	s := newTestServer(t, "", []runtime.Object{deploymentWithAvailable("nonprod", "d", 1)}, gate)
+
+	// First sweep succeeds and records a breakdown.
+	s.reconcileOnce(context.Background())
+	got, err := s.dyn.Resource(testGateGVR).Namespace("nonprod").Get(context.Background(), "app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get gate: %v", err)
+	}
+	before, found, _ := unstructured.NestedSlice(got.Object, "status", "results")
+	if !found || len(before) != 1 {
+		t.Fatalf("expected a populated status.results after a good sweep, got %v", before)
+	}
+
+	// Now break the namespace lookup, so nothing can be evaluated.
+	kube := s.kube.(*kubefake.Clientset)
+	kube.PrependReactor("get", "namespaces", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
+	})
+	s.reconcileOnce(context.Background())
+
+	status, reason, _, _ := readyConditionFields(t, s, "nonprod", "app")
+	if status != string(metav1.ConditionUnknown) || reason != reasonEvaluationFailed {
+		t.Errorf("condition = %s/%s, want Unknown/%s", status, reason, reasonEvaluationFailed)
+	}
+
+	got, err = s.dyn.Resource(testGateGVR).Namespace("nonprod").Get(context.Background(), "app", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("get gate: %v", err)
+	}
+	after, found, _ := unstructured.NestedSlice(got.Object, "status", "results")
+	// Contents, not length: a synthetic one-entry result for the mode failure itself
+	// would pass a length check while destroying the breakdown.
+	if !found || !reflect.DeepEqual(before, after) {
+		t.Errorf("status.results = %v, want the previous breakdown %v preserved", after, before)
 	}
 }

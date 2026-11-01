@@ -40,8 +40,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: gatekeeper
-          # Replace this with a released tag pinned by digest before running it
-          # anywhere that matters, the way the Dockerfile pins its own base images.
+          # Pin a released tag >= v2.0.0 by digest before running this anywhere that
+          # matters, the way the Dockerfile pins its own base images. v1.x is the
+          # request-API build and never writes Gate.status (see README's install).
           # Do NOT combine a floating tag with imagePullPolicy: IfNotPresent: a node
           # that already cached the tag never pulls the new build, versions diverge
           # per node, and because the pod template is then byte-identical between
