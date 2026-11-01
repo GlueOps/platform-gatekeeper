@@ -110,10 +110,7 @@ Argo CD has no built-in health check for a `Gate`, so you give it one. This is t
 whole script — it maps the `Ready` condition onto Argo CD's health vocabulary:
 
 ```lua
--- Reasons no amount of waiting can clear: each needs someone to change something
--- -- the Gate's spec, the namespace's mode label, gatekeeper's ClusterRole or
--- allowlist, or the stuck dependency itself. EvaluationFailed and
--- DependenciesNotReady are deliberately absent.
+-- Reasons no amount of waiting can clear. See AGENTS.md Decision 15.
 local stuck = {
   Terminal = true,
   PolicyViolation = true,
@@ -128,9 +125,7 @@ if obj.status == nil or obj.status.conditions == nil then
 end
 for i, c in ipairs(obj.status.conditions) do
   if c.type == "Ready" then
-    -- metav1 binds observedGeneration to the condition it was set from, so the
-    -- condition's own field ties currency to the very condition about to be
-    -- trusted; the status-level one is a fallback for writers that set only that.
+    -- Prefer the condition's own observedGeneration (metav1 binds it there).
     local observed = c.observedGeneration or obj.status.observedGeneration
     local generation = obj.metadata and obj.metadata.generation
     if generation == nil or observed ~= generation then
@@ -143,15 +138,11 @@ for i, c in ipairs(obj.status.conditions) do
       hs.status = "Healthy"
       return hs
     end
-    -- Degraded fails the operation rather than waiting. It needs selfHeal: true
-    -- to recover afterwards -- see AGENTS.md Decision 15, which records what this
-    -- was measured to do.
     if stuck[c.reason] then
       hs.status = "Degraded"
       return hs
     end
-    -- Everything else, including Unknown, means keep waiting. An unevaluable
-    -- gate makes no claim about the dependency, so Degraded would be wrong.
+    -- Unknown included: an unevaluable gate makes no claim either way.
     hs.status = "Progressing"
     return hs
   end

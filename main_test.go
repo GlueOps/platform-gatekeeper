@@ -235,9 +235,7 @@ func TestJobComplete(t *testing.T) {
 			wantMsg:   "job Complete=True",
 		},
 		{
-			// A failed Job will never complete on its own, so this must be
-			// terminal: a poller that treats it as "not yet" waits out its whole
-			// timeout for something that cannot happen.
+			// A failed Job never completes on its own, so this must be terminal.
 			name: "failed is terminal, and echoes the reason not the message",
 			job: &batchv1.Job{
 				Status: batchv1.JobStatus{
@@ -316,10 +314,8 @@ func TestArgoAppReady(t *testing.T) {
 	}{
 		{"healthy and synced", makeApp("Healthy", "Synced"), true, true, true, false, false},
 		{"healthy not synced", makeApp("Healthy", "OutOfSync"), true, true, false, false, false},
-		// Argo CD health is a rollup over an Application's resources, not a
-		// statement that its controller gave up, so none of these is terminal.
-		// Missing in particular is the normal state of an Application whose
-		// resources are not live yet -- exactly what a Gate should wait for.
+		// Argo CD health is a rollup over an Application's resources, not a statement that
+		// its controller gave up, so none of these is terminal.
 		{"degraded is not terminal", makeApp("Degraded", "Synced"), true, true, false, false, false},
 		{"missing is not terminal", makeApp("Missing", "Synced"), true, true, false, false, false},
 		{"progressing is not terminal", makeApp("Progressing", "Synced"), true, true, false, false, false},
@@ -396,9 +392,7 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 	cond := func(t, s, reason, m string) any {
 		return map[string]any{"type": t, "status": s, "reason": reason, "message": m}
 	}
-	// The messages carry a marker so the tests below can prove upstream text is
-	// never republished: a real one wraps a Helm error, which may wrap an admission
-	// webhook quoting the rejected object's field values.
+	// Marked so the tests below can prove upstream text is never republished.
 	ready := []any{cond("Ready", "True", "InstallSucceeded", "Helm install succeeded")}
 	notReady := []any{cond("Ready", "False", "InstallFailed", "LEAKED-UPSTREAM-TEXT")}
 	stalled := []any{
@@ -465,9 +459,7 @@ func TestFluxHelmReleaseReady(t *testing.T) {
 		}
 	})
 
-	// A Gate's status is readable by anyone who can read its namespace, and the
-	// Argo CD health check republishes it into the UI, so upstream condition
-	// messages must not travel.
+	// Gate status reaches the Argo CD UI, so upstream messages must not appear in it.
 	t.Run("upstream condition messages are never republished", func(t *testing.T) {
 		for name, conds := range map[string][]any{"not ready": notReady, "stalled": stalled} {
 			_, msg, _, _ := fluxHelmReleaseReady(makeHR(1, 1, conds), true)
@@ -845,10 +837,7 @@ var (
 	testFluxGVR = schema.GroupVersionResource{Group: "helm.toolkit.fluxcd.io", Version: "v2", Resource: "helmreleases"}
 )
 
-// newTestServer wires a Server onto fake clients. mode is the value of the
-// namespace mode label on "nonprod"; an empty string leaves it unlabelled, which
-// means customer mode. dynObjs holds Gates and any custom resources checks point
-// at (Argo CD Applications, Flux HelmReleases).
+// newTestServer wires a Server onto fake clients.
 func newTestServer(t *testing.T, mode string, kubeObjs []runtime.Object, dynObjs ...runtime.Object) *Server {
 	t.Helper()
 
@@ -961,9 +950,7 @@ func TestLastTransitionTimeInheritedWhenStatusUnchanged(t *testing.T) {
 	}
 }
 
-// A single API error must not report the dependency as unready: that would flip a
-// healthy Gate to False and, with the Argo CD health check installed, interrupt a
-// wave that was about to proceed.
+// One API error must not flip a healthy Gate to False and interrupt a live wave.
 func TestTransientErrorYieldsUnknownNotFalse(t *testing.T) {
 	gate := testGate("nonprod", "app", 1, map[string]any{
 		"id":                  "db",
@@ -1061,9 +1048,7 @@ func TestModeEnforcement(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// Deliberately driven through reconcileOnce rather than calling
-			// evaluateGate with a hand-computed mode: the namespace label is the
-			// policy boundary, so namespaceMode has to be the thing under test.
+			// Driven through reconcileOnce so the namespace lookup is covered too.
 			gate := testGate("nonprod", "app", 1, tt.check)
 			s := newTestServer(t, tt.mode, nil, gate)
 
@@ -1236,11 +1221,7 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-// Every check type must actually dispatch. The option names and the two custom
-// GVRs in evalOne are string literals hand-matched against crd.yaml, and a typo in
-// any of them fails silently — the key lookup misses, numOr/boolOr return the
-// default, and the predicate unit tests still pass because they take the value as
-// an argument. This is the test that catches that class.
+// Every check type must actually dispatch.
 func TestEveryCheckTypeDispatches(t *testing.T) {
 	boolPtr := func(b bool) *bool { return &b }
 
@@ -1436,9 +1417,8 @@ func deploymentWithAvailable(ns, name string, available int32) *appsv1.Deploymen
 	}
 }
 
-// Terminal is the signal that makes Argo CD fail a gated sync promptly instead of
-// waiting out --sync-timeout, so the plumbing that produces it needs covering end
-// to end, not just summarize's precedence.
+// Terminal is what makes Argo CD fail a gated sync rather than wait, so cover it
+// end to end.
 func TestTerminalReachesConditionAndResults(t *testing.T) {
 	gate := testGate("nonprod", "g", 1, map[string]any{
 		"id":          "migration",
@@ -1500,9 +1480,7 @@ func TestSweepSuccessAccounting(t *testing.T) {
 		}
 	})
 
-	// A CRD installed without its status subresource 404s every patch. Treating
-	// that as "the Gate was deleted" would stamp a successful sweep forever while
-	// no Gate ever carries a status, and the alert would never fire.
+	// A CRD installed without its status subresource 404s every patch.
 	t.Run("an all-404 sweep withholds the stamp", func(t *testing.T) {
 		s := newTestServer(t, "", []runtime.Object{deploymentWithAvailable("nonprod", "d", 1)}, newGate())
 		dyn := s.dyn.(*dynamicfake.FakeDynamicClient)
@@ -1581,20 +1559,15 @@ func TestHandleMetricsExposesTheAlertedSeries(t *testing.T) {
 	}
 }
 
-// The reason strings are a contract with the Lua health check, which compares them
-// as bare literals. Rename one here and terminal Gates quietly stop reading Degraded,
-// so a stalled dependency waits out the whole --sync-timeout instead of failing fast
-// — which is all of Decision 6's value — while both test suites stay green.
+// The reason strings are a contract with the Lua health check, which compares them as
+// bare literals.
 func TestHealthCheckScriptMatchesTheReasonContract(t *testing.T) {
 	script, err := healthCheckScript()
 	if err != nil {
 		t.Fatalf("extracting the script: %v", err)
 	}
 
-	// Match against code only, with comments dropped and spaces removed. Both matter:
-	// the script's prose names the two excluded reasons, so matching raw text makes a
-	// comment reword fail this test while reporting a bug that isn't there — and a
-	// commented-out `Terminal = true` would otherwise satisfy the positive checks.
+	// Match against code only, with comments dropped and spaces removed.
 	code := stripLuaComments(script)
 	compact := strings.ReplaceAll(code, " ", "")
 
@@ -1631,8 +1604,7 @@ func TestHealthCheckScriptMatchesTheReasonContract(t *testing.T) {
 	}
 
 	// And the two that must NOT be in it: a read failure makes no claim about the
-	// dependency, and not-ready is the normal waiting state. Either one landing on
-	// Degraded would fail syncs that were about to succeed.
+	// dependency, and not-ready is the normal waiting state.
 	for _, reason := range []string{
 		reasonEvaluationFailed,
 		reasonDependenciesNotReady,
@@ -1645,8 +1617,7 @@ func TestHealthCheckScriptMatchesTheReasonContract(t *testing.T) {
 }
 
 // README.md shows the health check inline so a reader can see what they are about to
-// paste into argocd-cm. That is a second copy of a load-bearing script, and it went
-// stale within hours of the first edit to the real one, so byte-compare them.
+// paste into argocd-cm.
 func TestReadmeShowsTheRealHealthCheck(t *testing.T) {
 	script, err := healthCheckScript()
 	if err != nil {
@@ -1673,9 +1644,7 @@ func TestReadmeShowsTheRealHealthCheck(t *testing.T) {
 	}
 }
 
-// stripLuaComments drops `--` to end of line. The script has no `--` inside a string
-// literal, and if one ever appears the result is a loud false failure rather than a
-// silent pass.
+// stripLuaComments drops `--` to end of line.
 func stripLuaComments(script string) string {
 	var b strings.Builder
 	for _, line := range strings.Split(script, "\n") {
@@ -1688,9 +1657,7 @@ func stripLuaComments(script string) string {
 	return b.String()
 }
 
-// healthCheckScript returns the Lua out of the ConfigMap patch fragment. Done by hand
-// rather than with a YAML library: the value is a literal block scalar, so dedenting
-// it is exact, and this keeps a parser out of go.mod for one key.
+// healthCheckScript returns the Lua out of the ConfigMap patch fragment.
 func healthCheckScript() (string, error) {
 	raw, err := os.ReadFile("examples/argocd-health-check.yaml")
 	if err != nil {
@@ -1710,18 +1677,14 @@ func healthCheckScript() (string, error) {
 		// inside the script is "\n", so this only matches that remainder.
 		case line == "":
 			return b.String(), nil
-		// Dedent before testing for blankness, not after: a whitespace-only line
-		// longer than the indent keeps its remaining spaces under `|`, and this
-		// function has to agree with kubectl byte for byte or the comparison it
-		// feeds is asserting against a normalised string instead of the real script.
+		// Dedent before testing for blankness: under `|` a whitespace-only line
+		// longer than the indent keeps its remaining spaces.
 		case strings.HasPrefix(line, "    "):
 			b.WriteString(strings.Repeat("\n", blanks))
 			blanks = 0
 			b.WriteString(line[4:])
-		// Held back rather than written: `|` clips trailing line breaks to exactly
-		// one, so blank lines only belong to the value if more content follows.
-		// Emitting them eagerly appends a newline the real value doesn't have, and
-		// the resulting mismatch is invisible in a diff.
+		// Held back rather than written: `|` clips trailing line breaks to exactly one, so
+		// blank lines only belong to the value if more content follows.
 		case strings.TrimSpace(line) == "":
 			blanks++
 		default:
@@ -1757,10 +1720,7 @@ func TestReconcileIntervalFloor(t *testing.T) {
 	}
 }
 
-// A Gate whose namespace mode can't be resolved reports Unknown, but it must not
-// destroy the per-check breakdown from the last real evaluation — that detail is
-// what an operator reads to find out why it stopped evaluating. The merge patch
-// replaces arrays, so writing an empty one would wipe it.
+// A mode-lookup failure reports Unknown without destroying the previous breakdown.
 func TestNamespaceModeFailurePreservesResults(t *testing.T) {
 	gate := testGate("nonprod", "app", 1, map[string]any{
 		"id":                  "db",

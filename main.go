@@ -49,15 +49,12 @@ const (
 
 	defaultReconcileInterval = 30 * time.Second
 	minReconcileInterval     = time.Second
-	// Gates are evaluated serially, so this bounds how far a sweep can be dragged
-	// out by unresponsive dependencies. Keep it well under the staleness alert's
-	// threshold divided by the expected Gate count.
+	// Bounds how far a serial sweep can be dragged out by a dead dependency.
 	perGateTimeout = 10 * time.Second
 	maxMessageLen  = 1024
 )
 
-// The Gate CRD's identity. Not configurable: a different group or plural means a
-// different CRD, which means a different crd.yaml and ClusterRole.
+// Not configurable: a different group or plural means a different CRD.
 var gateGVR = schema.GroupVersionResource{
 	Group:    "platform.glueops.dev",
 	Version:  "v1alpha1",
@@ -76,8 +73,7 @@ type Server struct {
 
 	reconcileInterval time.Duration
 
-	// Written by the reconcile loop, read by /metrics. These are the only mutable
-	// fields; everything else is fixed after main().
+	// The only mutable fields: written by the sweep, read by /metrics.
 	lastSweep     atomic.Int64 // unix time of the last sweep that wrote every Gate
 	gatesUnknown  atomic.Int64 // Gates whose last condition was Unknown
 	sweepDuration atomic.Int64 // milliseconds the last sweep took
@@ -112,8 +108,7 @@ func main() {
 		kube:    kube,
 		dyn:     dyn,
 		gateGVR: gateGVR,
-		// Empty by default: an operator that forgets these env vars gets no
-		// cross-namespace access rather than a silently working allowlist.
+		// Empty by default, so a forgotten env var denies rather than allows.
 		platformAllowedNS:       parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES")),
 		platformAllowedPrefixes: parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES")),
 		reconcileInterval:       reconcileInterval(),
@@ -150,8 +145,7 @@ func loadKubeConfig() (*rest.Config, error) {
 			return nil, err
 		}
 	}
-	// client-go defaults to 5 QPS / burst 10, which throttles a sweep that reads
-	// every check of every Gate and makes sweep duration scale badly.
+	// client-go defaults to 5 QPS / burst 10, which throttles a whole-fleet sweep.
 	cfg.QPS = 50
 	cfg.Burst = 100
 	return cfg, nil
@@ -167,9 +161,7 @@ func reconcileInterval() time.Duration {
 		log.Printf("warning: bad GATEKEEPER_RECONCILE_INTERVAL %q, using %s: %v", raw, defaultReconcileInterval, err)
 		return defaultReconcileInterval
 	}
-	// Below a second the loop would hammer the API server rather than reconcile;
-	// zero or negative would spin it with no pause at all. To stop reconciling,
-	// scale the Deployment to zero.
+	// To stop reconciling, scale the Deployment to zero.
 	if d < minReconcileInterval {
 		log.Printf("warning: GATEKEEPER_RECONCILE_INTERVAL %q is below the %s floor, using %s",
 			raw, minReconcileInterval, defaultReconcileInterval)
@@ -187,16 +179,12 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, "# TYPE gatekeeper_last_successful_sweep_timestamp_seconds gauge\n")
 	fmt.Fprintf(w, "gatekeeper_last_successful_sweep_timestamp_seconds %d\n", s.lastSweep.Load())
 
-	// A live gatekeeper writing Unknown to everything is a distinct failure from a
-	// dead one: the sweeps succeed, but no Gate carries a usable answer and every
-	// gated rollout waits. Kept separate so it can be alerted on with its own
-	// threshold rather than collapsed into sweep liveness.
+	// Distinct from a dead gatekeeper: sweeps succeed but no Gate has an answer.
 	fmt.Fprint(w, "# HELP gatekeeper_gates_unevaluated Gates whose last evaluation could not reach a verdict.\n")
 	fmt.Fprint(w, "# TYPE gatekeeper_gates_unevaluated gauge\n")
 	fmt.Fprintf(w, "gatekeeper_gates_unevaluated %d\n", s.gatesUnknown.Load())
 
-	// Gates are evaluated serially, so this is what distinguishes "wedged" from
-	// "slow" when the staleness alert fires.
+	// Distinguishes "wedged" from "slow" when the staleness alert fires.
 	fmt.Fprint(w, "# HELP gatekeeper_sweep_duration_seconds Wall time of the last completed sweep.\n")
 	fmt.Fprint(w, "# TYPE gatekeeper_sweep_duration_seconds gauge\n")
 	fmt.Fprintf(w, "gatekeeper_sweep_duration_seconds %.3f\n", float64(s.sweepDuration.Load())/1000)
@@ -208,8 +196,7 @@ func (s *Server) reconcileLoop(ctx context.Context) {
 	for {
 		s.reconcileOnce(ctx)
 
-		// Wait after the sweep rather than between sweep starts, so a slow sweep
-		// can never overlap the next one.
+		// After the sweep, not between starts, so sweeps can't overlap.
 		delay := s.reconcileInterval
 		if jitter := int64(s.reconcileInterval / 4); jitter > 0 {
 			delay += time.Duration(rand.Int63n(jitter))
@@ -241,11 +228,8 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		gate := &list.Items[i]
 		status, err := s.reconcileGate(ctx, gate, modes)
 		if err != nil {
-			// A Gate deleted mid-sweep is not a failure. This can't be used to
-			// infer that the sweep worked, though: a CRD installed without its
-			// status subresource 404s every patch, which would otherwise look
-			// like a cluster where every Gate was deleted at once. The wrote > 0
-			// requirement below is what catches that.
+			// Deleted mid-sweep is not a failure. The wrote > 0 check below is
+			// what catches a CRD with no status subresource 404ing every patch.
 			if !apierrors.IsNotFound(err) {
 				failed++
 				log.Printf("sweep: gate %s/%s: %v", gate.GetNamespace(), gate.GetName(), err)
@@ -286,8 +270,7 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 	if !cached {
 		resolved, modeErr := s.namespaceMode(ctx, ns)
 		if modeErr != nil {
-			// Policy is undecidable, so make no claim about readiness rather than
-			// defaulting to a mode and evaluating under the wrong rules.
+			// Undecidable policy: make no claim rather than assume a mode.
 			return metav1.ConditionUnknown, s.writeStatus(ctx, gate, metav1.ConditionUnknown,
 				reasonEvaluationFailed, fmt.Sprintf("namespace mode lookup failed: %v", modeErr), nil)
 		}
@@ -391,14 +374,9 @@ func (s *Server) evaluateGate(ctx context.Context, mode, gateNS string, gate *un
 	return results
 }
 
-// summarize rolls per-check results up into the Gate's Ready condition. It is the
-// only place the condition's status, reason and message are derived.
-//
-// Reasons are applied in a fixed precedence so the condition names the most
-// actionable problem rather than whichever check happened to sort first: a spec
-// error the author can fix outranks a policy violation, which outranks
-// gatekeeper's own missing RBAC, which outranks a dependency that will never
-// become ready, which outranks a dependency we simply could not evaluate.
+// summarize is the only place the condition's status, reason and message are
+// derived. Reasons follow a fixed precedence so the condition names the most
+// actionable problem rather than whichever check sorted first.
 func summarize(results []EvalResult) (metav1.ConditionStatus, string, string) {
 	if len(results) == 0 {
 		return metav1.ConditionFalse, reasonInvalidSpec, "gate has no checks"
@@ -425,9 +403,7 @@ func summarize(results []EvalResult) (metav1.ConditionStatus, string, string) {
 		}
 	}
 
-	// A not-ready result whose reason isn't in the table above would otherwise fall
-	// through to Ready, turning an unrecognised failure into a passing gate. Fail
-	// closed instead.
+	// Fail closed: an unrecognised reason must not fall through to Ready.
 	for _, r := range results {
 		if !r.Ready {
 			return metav1.ConditionFalse, reasonDependenciesNotReady,
@@ -565,8 +541,7 @@ func (s *Server) evalOne(ctx context.Context, ns, id string, check map[string]an
 		}
 		ready, msg, terminal, upstreamErr := argoAppReady(app, requireSynced, requireHealthy)
 		if upstreamErr != nil {
-			// The Application's own status is malformed; that is not the Gate
-			// author's mistake, so it must not be reported as InvalidSpec.
+			// Upstream's status is malformed, not the Gate author's mistake.
 			return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(upstreamErr.Error())}
 		}
 		return withTerminal(id, ready, msg, terminal)
@@ -623,10 +598,9 @@ func specErr(id, msg string) EvalResult {
 	return EvalResult{ID: id, Reason: reasonInvalidSpec, Message: truncate(msg)}
 }
 
-// readErr classifies an API read failure. A missing dependency is a normal
-// not-ready; a forbidden read means gatekeeper's own ClusterRole is short, which
-// an operator must fix; anything else is indeterminate and must not be reported
-// as a definite answer, or a single API blip would flip a healthy Gate to False.
+// readErr classifies a read failure. NotFound is a normal not-ready, Forbidden is
+// gatekeeper's own RBAC, anything else is indeterminate -- one API blip must not
+// flip a healthy Gate to False.
 func readErr(id, what, rule string, err error) EvalResult {
 	switch {
 	case apierrors.IsNotFound(err):
@@ -671,9 +645,7 @@ func statefulSetReady(sts *appsv1.StatefulSet, minReady int64, requireUpdated bo
 	return true, "statefulset ready"
 }
 
-// jobComplete reports Failed=True as terminal: a failed Job will not become
-// complete on its own, so a poller that treats it as "not ready yet" burns its
-// whole timeout waiting for something that cannot happen.
+// Failed=True is terminal: a failed Job will not complete on its own.
 func jobComplete(j *batchv1.Job) (ready bool, msg string, terminal bool) {
 	for _, c := range j.Status.Conditions {
 		if c.Type == batchv1.JobComplete && c.Status == corev1.ConditionTrue {
@@ -686,15 +658,8 @@ func jobComplete(j *batchv1.Job) (ready bool, msg string, terminal bool) {
 	return false, "job not complete yet", false
 }
 
-// argoAppReady evaluates an Argo CD Application's health and sync status.
-//
-// Nothing here is terminal. Argo CD's health is a rollup computed from an
-// Application's resources, not a statement that its controller has stopped trying:
-// Progressing and Degraded both occur mid-rollout, and Missing is simply the state
-// of an Application whose resources are not live yet, which is exactly what a Gate
-// guarding a not-yet-bootstrapped platform stack should wait for. Reporting any of
-// them as terminal would fail the gated sync — and because a Gate is re-evaluated
-// on every sync, a Degraded dependency would keep failing it.
+// Nothing here is terminal: Argo CD health is a rollup over an Application's
+// resources, not a controller giving up. See AGENTS.md Decision 6.
 func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (ready bool, msg string, terminal bool, err error) {
 	if requireHealthy {
 		healthStatus, found, nestedErr := unstructured.NestedString(app.Object, "status", "health", "status")
@@ -736,28 +701,10 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), false, nil
 }
 
-// fluxHelmReleaseReady evaluates a Flux helm.toolkit.fluxcd.io/v2 HelmRelease.
-//
-// Why this exists rather than pointing deploymentAvailable at the workload the
-// HelmRelease manages: a Deployment check reads whatever is currently in the cluster,
-// so during a failed upgrade it happily reports Ready against the *previous* revision's
-// pods while the release behind them is broken. That is a false green on precisely the
-// failure this check is for.
-//
-// Two conditions are evaluated, in this order:
-//
-//  1. Generation currency. helm-controller writes status.observedGeneration when it has
-//     acted on the current spec. If it lags metadata.generation the Ready condition
-//     describes an older revision and must not be trusted. Flux uses -1 for "never
-//     reconciled". Callers that genuinely want the last-known state regardless can set
-//     requireCurrentGeneration: false.
-//
-//  2. Stalled. When helm-controller exhausts spec.upgrade.remediation.retries it sets
-//     Stalled=True and stops retrying until the spec, values or chart version change --
-//     an interval tick does not clear it. This is reported as terminal, because the two
-//     need different responses: not-Ready means keep polling, Stalled means a human has
-//     to run `flux reconcile helmrelease <name> --reset`. A poller that cannot tell them
-//     apart burns its whole timeout on a release that was never going to recover.
+// fluxHelmReleaseReady checks generation currency first (a lagging
+// status.observedGeneration means Ready describes an older revision; Flux uses -1
+// for "never reconciled"), then Stalled, which is terminal: helm-controller has
+// exhausted its retries and won't retry until the spec or chart version changes.
 func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneration bool) (ready bool, msg string, terminal bool, err error) {
 	if requireCurrentGeneration {
 		gen, genFound, nestedErr := unstructured.NestedInt64(hr.Object, "metadata", "generation")
@@ -815,11 +762,8 @@ func fluxHelmReleaseReady(hr *unstructured.Unstructured, requireCurrentGeneratio
 	return true, "helmrelease Ready=True", false, nil
 }
 
-// withReason appends an upstream condition's reason, which controllers draw from a
-// bounded vocabulary. Upstream *messages* are not appended: they wrap arbitrary
-// third-party text (a Helm error quoting an admission webhook, which may quote the
-// rejected object's field values), and a Gate's status is readable by anyone who
-// can read its namespace and is re-published into the Argo CD UI.
+// Appends an upstream condition's reason, never its message: messages wrap
+// arbitrary third-party text, and a Gate's status reaches the Argo CD UI.
 func withReason(msg, reason string) string {
 	if reason == "" {
 		return msg
@@ -836,16 +780,9 @@ func podReady(p *corev1.Pod) bool {
 	return false
 }
 
-// countReadyAddressesForService counts the ready backends behind a Service.
-//
-// The EndpointSlice controller writes one slice per addressType, so a dual-stack
-// Service has an IPv4 slice and an IPv6 slice describing the *same* pods. Summing
-// across slices would therefore count every backend once per address family and
-// satisfy minReadyAddresses with half the pods. Taking the maximum across families
-// is correct on IPv4-only, IPv6-only and dual-stack clusters without hard-coding a
-// family. FQDN slices are ignored: the EndpointSlice controller doesn't produce
-// them for selector-based Services, so one appearing means something else wrote it
-// and letting it win the maximum would change what the count means.
+// Maximum across addressTypes, not a sum: a dual-stack Service has one slice per
+// family describing the SAME pods, so summing would satisfy minReadyAddresses with
+// half the backends. FQDN slices are ignored.
 func countReadyAddressesForService(ctx context.Context, kube kubernetes.Interface, ns, svcName string) (int64, error) {
 	lbl := fmt.Sprintf("kubernetes.io/service-name=%s", svcName)
 	slices, err := kube.DiscoveryV1().EndpointSlices(ns).List(ctx, metav1.ListOptions{LabelSelector: lbl})
@@ -871,15 +808,12 @@ func countReadyAddressesForService(ctx context.Context, kube kubernetes.Interfac
 	return ready, nil
 }
 
-// readyEndpoints counts ready endpoints, not addresses. Endpoints[].Addresses is
-// the address list for a single endpoint — upstream requires at least one entry
-// and tells consumers to use the first — so summing its length would count one pod
-// as several.
+// Counts endpoints, not addresses: Endpoints[].Addresses is one endpoint's address
+// list, so summing it would count one pod as several.
 func readyEndpoints(es *discoveryv1.EndpointSlice) int64 {
 	var n int64
 	for _, ep := range es.Endpoints {
-		// A nil Ready is "ready" per upstream, but controller-managed slices always
-		// set it, and failing closed is the right direction for a gate.
+		// Upstream treats nil Ready as ready; fail closed instead.
 		if ep.Conditions.Ready != nil && *ep.Conditions.Ready {
 			n++
 		}
@@ -890,10 +824,8 @@ func readyEndpoints(es *discoveryv1.EndpointSlice) int64 {
 // --- status
 
 // writeStatus patches the Ready condition and, unless results is nil, the per-check
-// breakdown. Pass nil ONLY when nothing was evaluated at all: the patch then omits
-// the key and leaves the previously published breakdown in place, because a merge
-// patch replaces arrays wholesale and `results: []` would erase it. Any caller that
-// did evaluate checks must pass what it got, empty slice included.
+// breakdown. Pass nil ONLY when nothing was evaluated: a merge patch replaces
+// arrays, so `results: []` would erase the previous breakdown.
 func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructured,
 	status metav1.ConditionStatus, reason, message string, results []EvalResult) error {
 
@@ -901,15 +833,12 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 	prevStatus, prevTransition := readyConditionOf(gate)
 
 	transition := metav1.Now().UTC().Format(time.RFC3339)
-	// metav1 semantics: lastTransitionTime marks the last time the status changed,
-	// not the last time it was observed. Inherit it unless the status flipped.
+	// metav1: lastTransitionTime marks the last CHANGE, not the last observation.
 	if prevStatus == string(status) && prevTransition != "" {
 		transition = prevTransition
 	}
 
-	// Log transitions only. Every sweep re-evaluating every Gate makes per-sweep
-	// logging pure volume, while the question worth answering later is when a Gate
-	// changed and why — which status.results overwrites.
+	// Transitions only; per-sweep logging would be pure volume.
 	if prevStatus != string(status) {
 		log.Printf("gate %s/%s: %s -> %s (%s) %s",
 			gate.GetNamespace(), gate.GetName(), orNone(prevStatus), status, reason, message)
@@ -997,9 +926,8 @@ func truncate(s string) string {
 	return s[:maxMessageLen-3] + "..."
 }
 
-// parseCSV drops empty entries, which matters for the allowlists: a trailing comma
-// must not produce an empty prefix, since strings.HasPrefix(ns, "") matches every
-// namespace.
+// Drops empty entries: a trailing comma must not yield an empty prefix, which
+// HasPrefix would match against every namespace.
 func parseCSV(s string) []string {
 	out := []string{}
 	for _, part := range strings.Split(s, ",") {

@@ -1,14 +1,8 @@
--- Tests for the Lua health check in argocd-health-check.yaml.
+-- Tests for the Lua health check in argocd-health-check.yaml. The script fails
+-- silently when wrong: Argo CD ignores a resource whose health check errors, so the
+-- wave hangs showing Unknown with nothing alerting.
 --
--- This script is load-bearing and fails silently when wrong: Argo CD ignores a
--- resource whose health check errors, so the wave hangs with the Application
--- showing Unknown and nothing alerting. The generation guard is the sharpest part —
--- without it an edited Gate is judged against the condition left from its previous
--- spec, so Argo CD sees Healthy and proceeds, bypassing the gate on the very sync
--- that tightened it.
---
--- Run it from the repo root (the script lives inside a ConfigMap value, so extract it
--- first). Same commands .github/workflows/ci.yaml runs, minus the digest pins:
+-- Run from the repo root; same commands .github/workflows/ci.yaml runs:
 --
 --   mkdir -p .testtmp
 --   cp examples/argocd-health-check_test.lua examples/argocd-health-check.yaml .testtmp/
@@ -20,10 +14,8 @@
 --       lua argocd-health-check_test.lua; done
 --   rm -rf .testtmp
 --
--- Both dialects, not just 5.4: Argo CD embeds gopher-lua, a Lua 5.1 dialect, so a
--- 5.4-only run would accept syntax the real runtime rejects — which is why the two
--- lines below take their 5.1 spellings. The harness is still more permissive than
--- Argo CD's sandbox; AGENTS.md has the caveat.
+-- Both dialects: Argo CD embeds gopher-lua (5.1), hence the 5.1 spellings below.
+-- The harness is still more permissive than Argo CD's sandbox; see AGENTS.md.
 
 local src = assert(io.open("health.lua")):read("*a") -- "a" is 5.2+
 local chunk = assert((loadstring or load)(src, "health.lua")) -- loadstring is 5.1

@@ -1,12 +1,9 @@
-# promtool unit tests for prometheusrule.yaml. These alerts are the entire
-# staleness mitigation, and the obvious expression for "gatekeeper is down" does
-# NOT fire for the most likely outage — a pod that is still in service discovery
-# but cannot be scraped, where `up` is a present 0 and the gauge goes stale, so a
-# naive `absent(up{...})` plus a `time() - gauge` arm are both false. These tests
-# pin that behaviour, and the thresholds.
+# promtool unit tests for prometheusrule.yaml. The obvious "gatekeeper is down"
+# expression does NOT fire for the likeliest outage (a pod in service discovery that
+# cannot be scraped: `up` is a present 0 and the gauge goes stale), which is what
+# these pin, along with the thresholds.
 #
-# Run them from the repo root (promtool wants bare rule groups, not the PrometheusRule
-# wrapper). Same commands .github/workflows/ci.yaml runs, minus the digest pins:
+# Run from the repo root; same commands .github/workflows/ci.yaml runs:
 #
 #   mkdir -p .testtmp && cp prometheusrule_test.yaml prometheusrule.yaml .testtmp/
 #   docker run --rm -v "$PWD/.testtmp":/workdir mikefarah/yq:4.47.1 '.spec' \
@@ -16,11 +13,7 @@
 #   rm -rf .testtmp
 #
 # At least one case must assert a FIRING alert: promtool loads a null or empty rule
-# file without error, so a broken extraction only surfaces as a missing exp_alert.
-#
-# promtool compares the whole annotation set, so each description is spelled out
-# once as a YAML anchor at its first use and aliased afterwards. Keep them in step
-# with prometheusrule.yaml.
+# file without error.
 rule_files:
   - rules.yaml
 evaluation_interval: 1m

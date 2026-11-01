@@ -1,30 +1,12 @@
-# Optional, and separate from deploy.yaml so a cluster without the Prometheus
-# Operator can still apply the rest.
+# Optional; needs the Prometheus Operator. These alerts are the whole staleness
+# mitigation -- see AGENTS.md Decision 2.
 #
-# These alerts are the whole staleness mitigation. Gatekeeper publishes Gate
-# readiness rather than answering requests, so a gatekeeper that is down or wedged
-# leaves Gates showing their last known state. Argo CD reads that state without
-# being able to tell how old it is, so a rollout gated on an already-Ready Gate can
-# proceed on stale information until someone acts on these.
+# TWO THINGS MUST LINE UP or the mitigation is silently absent:
+#   1. `job=` below must match your scrape config. servicemonitor.yaml yields this.
+#   2. metadata.labels must satisfy your Prometheus's ruleSelector
+#      (kube-prometheus-stack defaults to `{release: <releaseName>}`).
 #
-# TWO THINGS MUST LINE UP, or the mitigation is silently absent:
-#
-#  1. `job="glueops-core-gatekeeper"` below must match the label your scrape config
-#     produces. servicemonitor.yaml yields exactly this (the Prometheus Operator
-#     defaults `job` to the Service name). If you scrape via pod annotations or a
-#     hand-written job instead, fix the label here — otherwise `absent()` is true
-#     forever on a healthy cluster, the alert fires immediately, gets silenced, and
-#     takes the arms that do work with it.
-#  2. `metadata.labels` must satisfy your Prometheus's `ruleSelector`.
-#     kube-prometheus-stack defaults to `ruleSelector: {release: <releaseName>}`, so
-#     add that label or the rule is accepted by the apiserver, shows up in
-#     `kubectl get prometheusrule`, and is never loaded.
-#
-# Verify after installing, rather than assuming:
-#   promtool check rules prometheusrule.yaml
-#   # then, in Prometheus:
-#   up{job="glueops-core-gatekeeper"}
-#   prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*gatekeeper.*"}
+# promtool tests: prometheusrule_test.yaml
 apiVersion: monitoring.coreos.com/v1
 kind: PrometheusRule
 metadata:
@@ -37,24 +19,9 @@ spec:
   groups:
     - name: glueops-core-gatekeeper
       rules:
-        # Gatekeeper is not publishing fresh readiness. Every arm is wrapped in
-        # max() so they share one empty labelset: with differing labelsets Prometheus
-        # discards the pending state when the firing arm changes and restarts `for`,
-        # which delays a wedged-then-restarted pod by the full period again.
-        #
-        # The arms, and why each is needed:
-        #   - stale gauge: a live pod whose sweep is wedged or failing.
-        #   - up == 0: a pod that exists but cannot be scraped (CrashLoopBackOff,
-        #     OOMKilled, wedged listener). This arm is essential -- `absent()` does
-        #     NOT cover it, because `up` is a present series with value 0, and the
-        #     failed scrape stale-marks the gauge so the first arm goes empty too.
-        #   - absent: the target has left service discovery entirely.
-        #
-        # 300s rather than something tighter because Gates are evaluated serially
-        # with a 10s per-Gate ceiling, so a cluster with many Gates and unresponsive
-        # dependencies can legitimately take minutes. Raise it if you run far more
-        # Gates than that, and use gatekeeper_sweep_duration_seconds to tell a slow
-        # sweep from a wedged one.
+        # Three arms: stale gauge (wedged sweep), up==0 (pod unscrapable -- absent()
+        # does NOT cover it), absent (target gone). max() keeps one labelset so a
+        # change of firing arm doesn't restart `for`. 300s because sweeps are serial.
         - alert: GatekeeperNotReconciling
           expr: >-
             max(time() - gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper"}) > 300
@@ -78,11 +45,8 @@ spec:
               An Argo CD sync stuck waiting on a gate is released with
               `argocd app terminate-op <app>`.
 
-        # A live gatekeeper that cannot reach a verdict is a different failure: the
-        # sweeps succeed, so the alert above stays quiet, but no Gate carries a
-        # usable answer and every gated rollout waits. Separate rule so it can be
-        # tuned independently -- a single Gate going Unknown for one sweep is a
-        # normal transient, which is why this is patient.
+        # Sweeps succeed but no Gate has a usable answer, so the alert above stays
+        # quiet. Patient: one Gate Unknown for one sweep is a normal transient.
         - alert: GatekeeperGatesUnevaluated
           expr: max(gatekeeper_gates_unevaluated{job="glueops-core-gatekeeper"}) > 0
           for: 15m

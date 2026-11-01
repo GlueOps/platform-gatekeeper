@@ -5,7 +5,6 @@ on:
     branches: [main]
   pull_request:
 
-# A PR push supersedes its own earlier run; each one pulls ~500MB of images.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -18,8 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      # ghcr.io and quay.io rather than Docker Hub: identical digests, no anonymous
-      # per-IP pull limit to flake on from a shared runner.
+      # ghcr.io/quay.io: identical digests, no anonymous pull limit.
       YQ: ghcr.io/mikefarah/yq:4.47.1@sha256:b9285dd3b0bea3c34d0c54415dd48d767dabd9644d489bd6e253660847b58419
       LUA51: nickblah/lua:5.1-alpine@sha256:4d1e728ab63affad53db672f363ec2f416d83decbfd4c9741ee1055e112485c8
       LUA54: nickblah/lua:5.4-alpine@sha256:d2f20d6ec71f987f79ca0f25d5d9a2b3620f97db179f9a2b8f2177c3330952f9
@@ -28,10 +26,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
-          # Otherwise the job's token is left in .git/config as an http extraheader,
-          # and `go test ./...` runs a fork PR's own Go code on this runner, where an
-          # init() could read it. No step needs git auth after checkout: nothing
-          # pushes, there are no submodules, and every module is public.
+          # Keeps the job token out of .git/config, which `go test` on a fork PR
+          # could read. No step needs git auth after checkout.
           persist-credentials: false
 
       - name: Set up Go
@@ -48,26 +44,20 @@ jobs:
       - name: Test
         run: go test ./...
 
-      # The two suites below cover scripts that live inside YAML and whose failure is
-      # silent, which is why they get a CI step rather than a line in a file header.
-      # `if: !cancelled()` so a Go failure doesn't hide them, and the containers are
-      # mounted on .testtmp rather than $PWD so a third-party image sees only the two
-      # files under test. Same commands the test headers give, pinned by digest here.
+      # Two suites `go test` can't reach, whose failure is silent. Mounted on
+      # .testtmp so the images see only the files under test.
       - name: Test the Argo CD health check
         if: ${{ !cancelled() }}
         run: |
-          # rm first: .gitignore does not stop a PR committing .testtmp as a symlink
-          # to the repo root, which mkdir -p accepts and Docker resolves host-side,
-          # handing the container everything the mount was narrowed to exclude.
-          # NEVER add a trailing slash -- `rm -rf .testtmp/` follows the symlink and
-          # deletes the resolved directory's contents, i.e. the checkout.
+          # rm first: a PR can commit .testtmp as a symlink to the repo root, which
+          # mkdir -p accepts. NEVER add a trailing slash -- it would follow the
+          # symlink and delete the checkout.
           rm -rf .testtmp && mkdir -p .testtmp
           cp examples/argocd-health-check_test.lua examples/argocd-health-check.yaml .testtmp/
           docker run --rm -v "$PWD/.testtmp":/workdir "$YQ" \
             '.data["resource.customizations.health.platform.glueops.dev_Gate"]' \
             argocd-health-check.yaml > .testtmp/health.lua
-          # 5.1 as well as 5.4: Argo CD embeds gopher-lua, a 5.1 dialect, so a
-          # 5.4-only run would accept syntax the real runtime rejects.
+          # 5.1 too: Argo CD embeds gopher-lua, a 5.1 dialect.
           docker run --rm -v "$PWD/.testtmp":/t -w /t "$LUA51" lua argocd-health-check_test.lua
           docker run --rm -v "$PWD/.testtmp":/t -w /t "$LUA54" lua argocd-health-check_test.lua
 

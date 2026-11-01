@@ -1,6 +1,5 @@
-# The Gate and the workloads it gates must be in the *same* Application: sync
-# waves only order resources within one sync operation. Gating across Applications
-# is not supported by this pattern.
+# The Gate and what it gates must be in the SAME Application; waves only order
+# within one sync.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
@@ -11,7 +10,6 @@ spec:
   source:
     repoURL: https://github.com/your-org/your-manifests
     targetRevision: main
-    # A directory holding gate.yaml and deployment.yaml together.
     path: apps/my-app
   destination:
     server: https://kubernetes.default.svc
@@ -19,7 +17,5 @@ spec:
   syncPolicy:
     automated:
       prune: true
-      # selfHeal is required, not a preference: a failed sync blocks auto-sync of
-      # that revision, so without it a gated sync that fails once never retries --
-      # fixing the dependency leaves the Application OutOfSync until a new commit.
+      # Required: without it a gated sync that fails once never retries.
       selfHeal: true

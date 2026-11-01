@@ -11,18 +11,12 @@ metadata:
   name: glueops-core-gatekeeper
   namespace: glueops-core-gatekeeper
 ---
-# This ClusterRole is the ceiling on what any Gate can observe. Gatekeeper reads
-# dependencies with its own identity, so a kind granted here becomes readable by
-# any Gate (within its own namespace, or an allowlisted namespace in platform
-# mode). Add kinds deliberately, and never grant secrets or configmaps.
+# The ceiling on what any Gate can observe. Never grant secrets or configmaps.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: glueops-core-gatekeeper
 rules:
-  # The reconcile loop lists every Gate each sweep and merge-patches its status.
-  # Deliberately no `get` (nothing reads a single Gate) and no `update` (status is
-  # only ever merge-patched).
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates"]
     verbs: ["list"]
@@ -31,12 +25,12 @@ rules:
     resources: ["gates/status"]
     verbs: ["patch"]
 
-  # Resolves the customer/platform mode label on a Gate's namespace.
+  # Resolves the mode label on a Gate's namespace.
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get"]
 
-  # Allowlisted dependency reads, one rule per supported check type.
+  # One rule per supported check type.
   - apiGroups: ["apps"]
     resources: ["deployments", "statefulsets"]
     verbs: ["get"]
