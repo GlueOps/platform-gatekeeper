@@ -218,12 +218,14 @@ rollouts are correctly gated — review with multi-tenancy and failure modes in 
 
 Verified against upstream, and easy to get wrong:
 
-- **The Gate is kept out of the Application health rollup** by
-  `argocd.argoproj.io/ignore-healthcheck: "true"` in the shipped example. Argo CD's
-  app controller honours that annotation; the sync engine reads the Gate's health
-  directly and ignores it, so wave gating and terminal fail-fast still work. Without
-  the annotation, a Gate left blocked or terminal after a rollout keeps the whole
-  Application `Degraded` while its workloads are fine.
+- **`argocd.argoproj.io/ignore-healthcheck` is deliberately NOT set** in the shipped
+  example. It removes the Gate from the Application health rollup while leaving wave
+  gating intact (the sync engine reads the Gate's health directly and ignores the
+  annotation) — but measured against the same blocked Gate, the Application reads
+  `Progressing` without it and `Healthy` with it. An Application reporting Healthy
+  while its declared dependency is down is the worse default. It remains the opt-out
+  for teams where a terminal Gate left in place keeping the Application `Degraded`
+  matters more.
 - **`resource.exclusions` matching `gates` silently un-gates everything.** An
   excluded Gate is stripped from the target objects, so it is never applied, never
   produces a sync task, and the next wave runs immediately. The only signal is an

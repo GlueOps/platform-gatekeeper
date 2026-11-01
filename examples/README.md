@@ -28,6 +28,14 @@ Three things decide whether this works:
    condition has to stay true for the life of the Application — see the note in
    `wave-gating/gate.yaml` about why gating on a migration Job eventually wedges.
 
+## Confirming it gates
+
+A Gate that exists but gates nothing looks identical to one that works until you
+check. Point an Application at a Gate whose dependency is down; `kubectl get
+application <app> -n argocd -o jsonpath='{.status.operationState.message}'` should
+read `waiting for healthy state of platform.glueops.dev/Gate/<name>`, and the
+wave-0 workload should not exist yet. See README's "Confirming it actually gates".
+
 ## Platform setup: `argocd-health-check.yaml`
 
 The Lua health check that teaches Argo CD how to read a Gate, applied once per Argo

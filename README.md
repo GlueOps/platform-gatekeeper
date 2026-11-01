@@ -104,6 +104,42 @@ first.
 
 ### 3. Teach Argo CD to read a Gate — required
 
+Argo CD has no built-in health check for a `Gate`, so you give it one. This is the
+whole script — it maps the `Ready` condition onto Argo CD's health vocabulary:
+
+```lua
+hs = {}
+if obj.status == nil or obj.status.conditions == nil then
+  hs.status = "Progressing"; hs.message = "Awaiting first evaluation"; return hs
+end
+-- An edited Gate must not be judged against its previous spec's condition.
+if obj.metadata.generation ~= nil and obj.status.observedGeneration ~= obj.metadata.generation then
+  hs.status = "Progressing"; hs.message = "Awaiting evaluation of current spec"; return hs
+end
+for i, c in ipairs(obj.status.conditions) do
+  if c.type == "Ready" then
+    hs.message = (c.reason or "") .. ": " .. (c.message or "")
+    if c.status == "True" then hs.status = "Healthy"; return hs end
+    if c.reason == "Terminal" then hs.status = "Degraded"; return hs end
+    hs.status = "Progressing"; return hs
+  end
+end
+hs.status = "Progressing"; hs.message = "No Ready condition"; return hs
+```
+
+**If `argocd-cm` is managed by the argo-cd Helm chart** (the common case), put it in
+your values under `configs.cm` and let your normal pipeline apply it:
+
+```yaml
+configs:
+  cm:
+    resource.customizations.health.platform.glueops.dev_Gate: |
+      hs = {}
+      ...          # the script above, indented under this key
+```
+
+**Otherwise patch the live ConfigMap** with the ready-made fragment:
+
 ```bash
 kubectl patch configmap argocd-cm -n argocd --type merge \
   --patch-file examples/argocd-health-check.yaml
@@ -183,6 +219,50 @@ Two rules that are easy to get wrong:
   Gate already exists — PreSync runs before manifests are applied, so a Gate shipped
   alongside the workloads won't exist yet and the wait will fail immediately.
 
+### Confirming it actually gates
+
+The failure mode to rule out is a Gate that exists but gates nothing — a missing
+health check, a Gate in wave `0`, or a Gate in a different Application all look
+fine until you check. Point an Application at a Gate whose dependency is *down* and
+you should see the sync held:
+
+```console
+$ kubectl get application my-app -n argocd \
+    -o jsonpath='{.status.operationState.phase}{"\n"}{.status.operationState.message}'
+Running
+waiting for healthy state of platform.glueops.dev/Gate/my-app-dependencies
+
+$ kubectl get gates -n nonprod
+NAME                  READY   REASON                 LAST-TRANSITION
+my-app-dependencies   False   DependenciesNotReady   4m21s
+
+$ kubectl get deploy my-app -n nonprod
+Error from server (NotFound): deployments.apps "my-app" not found     # wave 0 held
+```
+
+The `waiting for healthy state of …/Gate/…` message is the proof: Argo CD is
+blocking on the Gate specifically. Then make the dependency ready, and within one
+reconcile interval:
+
+```console
+$ kubectl get gates -n nonprod
+NAME                  READY   REASON   LAST-TRANSITION
+my-app-dependencies   True    Ready    9s
+
+$ kubectl get deploy my-app -n nonprod
+NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+my-app   2/2     2            2           9s
+
+$ kubectl get application my-app -n argocd \
+    -o jsonpath='{.status.health.status} {.status.sync.status} {.status.operationState.phase}'
+Healthy Synced Succeeded
+```
+
+If instead the workload appears immediately while the Gate is still `False`, the
+Gate isn't gating. Check, in order: the health check from step 3 is installed, the
+Gate is annotated `sync-wave: "-1"` and not `"0"`, the Gate is in the *same*
+Application as the workload, and `gates` isn't matched by `resource.exclusions`.
+
 ### Reading status
 
 ```bash
@@ -213,15 +293,17 @@ $ kubectl get gate my-app-dependencies -n nonprod -o jsonpath='{.status.results}
 instead of waiting out the timeout. Everything else that isn't ready reads as
 `Progressing`.
 
-One consequence worth knowing: because Argo CD folds resource health into the
-Application's on a worst-wins basis, a Gate left blocked or terminal *after* a
-rollout keeps the Application `Degraded` even when every workload is healthy — so
-health notifications and `argocd app wait` fire on the dependency rather than on
-your app, and later syncs fail at wave `-1`, including an unrelated image bump.
-Annotating the Gate `argocd.argoproj.io/ignore-healthcheck: "true"` removes it from
-that rollup while leaving wave gating and terminal fail-fast fully intact, because
-the sync engine reads the Gate's health directly rather than through the rollup.
-The shipped example sets it.
+Because Argo CD folds resource health into the Application's on a worst-wins basis,
+a blocked Gate shows up as the Application being `Progressing`, and a *terminal* one
+as `Degraded`. Annotating a Gate `argocd.argoproj.io/ignore-healthcheck: "true"`
+removes it from that rollup while leaving wave gating intact (the sync engine reads
+the Gate's health directly and ignores the annotation).
+
+The shipped example deliberately does **not** set it. Measured against the same
+blocked Gate: without the annotation the Application reads `Progressing`, with it
+the Application reads `Healthy` — i.e. healthy while its declared dependency is
+down. Reach for it only if a terminal Gate left in place after a rollout keeping the
+Application `Degraded` is worse for you than that.
 
 Note that `LAST-TRANSITION` is the last time the condition *changed*, not the last
 time it was evaluated — so it cannot tell you whether gatekeeper is still running.

@@ -24,17 +24,21 @@ metadata:
   namespace: nonprod
   annotations:
     argocd.argoproj.io/sync-wave: "-1"
-    # Keeps the Gate out of the Application's *health rollup* while leaving wave
-    # gating fully intact: Argo CD's app controller honours this annotation, but the
-    # sync engine reads the Gate's health directly and ignores it.
     #
-    # Without it the Gate's health is folded into the Application's on a worst-wins
-    # basis, so a blocked or terminal Gate leaves the Application showing Degraded
-    # indefinitely even when every workload is fine — firing health notifications
-    # and tripping `argocd app wait` on a dependency rather than on your app.
+    # Deliberately NOT setting argocd.argoproj.io/ignore-healthcheck here. That
+    # annotation keeps the Gate out of the Application's health rollup, and measured
+    # against a blocked Gate the difference is:
     #
-    # Remove it if you would rather see gate state in the Application's health.
-    argocd.argoproj.io/ignore-healthcheck: "true"
+    #   without it:  Application health = Progressing   (dependency is down)
+    #   with it:     Application health = Healthy        (misleading)
+    #
+    # Wave gating works either way — the sync engine reads the Gate's health
+    # directly and ignores the annotation — so the only thing it buys is hiding gate
+    # state from the Application, which is the wrong default.
+    #
+    # Set it only if a *terminal* Gate (a failed Job, a stalled HelmRelease) left in
+    # place after a rollout keeping the Application Degraded is worse for you than
+    # an Application that reads Healthy while its dependency is broken.
 spec:
   checks:
     - id: database
