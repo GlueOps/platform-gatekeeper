@@ -5,13 +5,17 @@ on:
     branches:
       - main
 
-permissions:
-  contents: write
-  pull-requests: write
+# Every write goes through the App token below, so GITHUB_TOKEN needs nothing.
+permissions: {}
+
+concurrency:
+  group: release-please
+  cancel-in-progress: false
 
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       # Authenticate with the public-release-please GitHub App (NOT GITHUB_TOKEN).
       # App installation tokens trigger downstream workflows (so the release tag
@@ -21,6 +25,10 @@ jobs:
         with:
           app-id: ${{ secrets.RELEASE_PLEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLEASE_APP_PRIVATE_KEY }}
+          # Without these the token carries every permission the org-wide App
+          # installation holds, not just what cutting a release needs.
+          permission-contents: write
+          permission-pull-requests: write
 
       - uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
         with:

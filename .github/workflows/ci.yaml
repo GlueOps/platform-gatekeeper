@@ -44,6 +44,12 @@ jobs:
       - name: Test
         run: go test ./...
 
+      # -race needs cgo, so this runs on the Debian image rather than alpine. The
+      # three published atomics are written by the sweep and read by /metrics, so
+      # a race there is exactly the silent failure this job exists to catch.
+      - name: Test (race)
+        run: go test -race ./...
+
       # Two suites `go test` can't reach, whose failure is silent. Mounted on
       # .testtmp so the images see only the files under test.
       - name: Test the Argo CD health check

@@ -80,6 +80,7 @@ type Server struct {
 	lastSweep     atomic.Int64 // unix time of the last sweep that wrote every Gate
 	gatesUnknown  atomic.Int64 // Gates whose last condition was Unknown
 	sweepDuration atomic.Int64 // milliseconds the last sweep took
+	everSwept     atomic.Bool  // latched by the first successful sweep; gates /readyz
 }
 
 type EvalResult struct {
@@ -124,6 +125,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
+	mux.HandleFunc("/readyz", s.handleReadyz)
 	mux.HandleFunc("/metrics", s.handleMetrics)
 
 	srv := &http.Server{Addr: ":" + envOr("PORT", defaultPort), Handler: mux}
@@ -171,6 +173,21 @@ func reconcileInterval() time.Duration {
 		return defaultReconcileInterval
 	}
 	return d
+}
+
+// handleReadyz reports whether a sweep has EVER succeeded. /healthz cannot do
+// this job: it answers 200 before the first sweep, so a build that serves HTTP
+// but cannot list Gates goes Ready and `maxUnavailable: 0` then deletes the pod
+// that was still reconciling. Deliberately latching -- it never goes false
+// again, because pulling a running controller out of the Service on a transient
+// apiserver outage would also stop /metrics being scraped, and staleness is an
+// alert rather than a restart.
+func (s *Server) handleReadyz(w http.ResponseWriter, r *http.Request) {
+	if s.everSwept.Load() {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+	http.Error(w, "no sweep has completed yet", http.StatusServiceUnavailable)
 }
 
 // --- metrics
@@ -250,6 +267,7 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 
 	if failed == 0 && (wrote > 0 || len(list.Items) == 0) {
 		s.lastSweep.Store(time.Now().Unix())
+		s.everSwept.Store(true)
 	}
 	log.Printf("sweep: %d gates, %d written, %d unevaluated, %d failed, %s",
 		len(list.Items), wrote, unknown, failed, time.Since(started).Round(time.Millisecond))

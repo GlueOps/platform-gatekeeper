@@ -55,9 +55,12 @@ spec:
               path: /healthz
               port: http
             periodSeconds: 10
+          # /readyz, not /healthz: healthz answers 200 before the first sweep, so a
+          # build that serves HTTP but cannot list Gates would go Ready and
+          # maxUnavailable:0 would delete the pod still reconciling.
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: http
             periodSeconds: 10
           resources:

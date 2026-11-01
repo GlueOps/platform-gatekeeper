@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -1725,6 +1726,76 @@ func healthCheckScript() (string, error) {
 		}
 	}
 	return b.String(), nil
+}
+
+// /healthz answers 200 before the first sweep, so readiness has to be separate:
+// a build that serves HTTP but cannot list Gates must not go Ready and let
+// maxUnavailable:0 delete the pod that was still reconciling.
+func TestReadyzGatesOnTheFirstSweep(t *testing.T) {
+	s := newTestServer(t, "", nil)
+
+	rec := httptest.NewRecorder()
+	s.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("before any sweep: code = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+
+	s.reconcileOnce(context.Background())
+
+	rec = httptest.NewRecorder()
+	s.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("after a sweep: code = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	// Latching: a later failing sweep must not pull a live controller out of the
+	// Service, because that also stops /metrics being scraped.
+	s.dyn.(*dynamicfake.FakeDynamicClient).PrependReactor("list", "gates",
+		func(k8stesting.Action) (bool, runtime.Object, error) {
+			return true, nil, apierrors.NewInternalError(errors.New("apiserver unavailable"))
+		})
+	s.reconcileOnce(context.Background())
+
+	rec = httptest.NewRecorder()
+	s.handleReadyz(rec, httptest.NewRequest(http.MethodGet, "/readyz", nil))
+	if rec.Code != http.StatusOK {
+		t.Errorf("after a failing sweep: code = %d, want it to stay %d", rec.Code, http.StatusOK)
+	}
+}
+
+// The metric names are a contract with prometheusrule.yaml, and asserting them
+// only as Go literals is one-directional: a typo in the rule file plus the same
+// string in the promtool fixtures passes all three suites while the only
+// staleness alert silently never fires.
+func TestAlertsReferenceTheExportedMetrics(t *testing.T) {
+	raw, err := os.ReadFile("prometheusrule.yaml")
+	if err != nil {
+		t.Fatalf("reading the alerts: %v", err)
+	}
+	rules := string(raw)
+
+	for _, metric := range []string{
+		"gatekeeper_last_successful_sweep_timestamp_seconds",
+		"gatekeeper_gates_unevaluated",
+	} {
+		if !strings.Contains(rules, metric) {
+			t.Errorf("prometheusrule.yaml never mentions %s, so the alert that\n"+
+				"depends on it cannot fire", metric)
+		}
+	}
+
+	// And the other direction: every gatekeeper_ series the rules key on must be
+	// one /metrics actually exports.
+	rec := httptest.NewRecorder()
+	s := newTestServer(t, "", nil)
+	s.handleMetrics(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	exported := rec.Body.String()
+
+	for _, m := range regexp.MustCompile(`gatekeeper_[a-z_]+`).FindAllString(rules, -1) {
+		if !strings.Contains(exported, m) {
+			t.Errorf("prometheusrule.yaml keys on %s, which /metrics does not export", m)
+		}
+	}
 }
 
 func TestReconcileIntervalFloor(t *testing.T) {
