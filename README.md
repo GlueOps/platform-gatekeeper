@@ -84,7 +84,7 @@ today.
 ### 1. CRD and RBAC
 
 ```bash
-kubectl apply -f crd.yaml
+kubectl apply -f crds/gates.yaml
 kubectl apply -f rbac.yaml
 ```
 
@@ -625,7 +625,7 @@ therefore a privileged grant.
 ## Upgrading from an earlier build
 
 The `Gate` schema changed incompatibly, which is what `v1alpha1` is for — the
-version is unchanged, so `kubectl apply -f crd.yaml` works in place. There is no
+version is unchanged, so `kubectl apply -f crds/gates.yaml` works in place. There is no
 `status.storedVersions` migration and nothing to convert: the apiserver prunes
 removed fields such as `spec.strict` from Gates already in the cluster.
 

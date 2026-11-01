@@ -23,7 +23,7 @@ credentials and need no RBAC.
 | --- | --- |
 | `main.go` | all application code — reconcile loop, evaluation, readiness predicates, status writing |
 | `main_test.go` | unit tests for the predicates plus reconcile-level tests on fake clients |
-| `crd.yaml` | the `Gate` CRD, including the CEL rule enforcing exactly one check type |
+| `crds/gates.yaml` | the `Gate` CRD, including the CEL rule enforcing exactly one check type. In a directory so platform-crds can pin it as a kustomize source |
 | `rbac.yaml` | ServiceAccount, ClusterRole, binding — **the ceiling on what any Gate can read** |
 | `deploy.yaml` | Deployment and Service |
 | `servicemonitor.yaml` | scrape config, shipped so the alerts' `job` label is a contract |
@@ -61,7 +61,7 @@ End-to-end against a throwaway cluster:
 ```bash
 k3d cluster create gatekeeper-test
 docker build -t platform-gatekeeper:dev . && k3d image import platform-gatekeeper:dev -c gatekeeper-test
-kubectl apply -f crd.yaml -f rbac.yaml -f deploy.yaml
+kubectl apply -f crds/gates.yaml -f rbac.yaml -f deploy.yaml
 kubectl set image deployment/glueops-core-gatekeeper gatekeeper=platform-gatekeeper:dev -n glueops-core-gatekeeper
 ```
 
@@ -111,7 +111,7 @@ apiserver prunes removed fields such as `spec.strict` from stored Gates.
 
 ### Adding a check type
 
-1. Add the schema block to `crd.yaml` **and** the key to the CEL rule's list.
+1. Add the schema block to `crds/gates.yaml` **and** the key to the CEL rule's list.
 2. Add the key to `countCheckTypes()` in `main.go`.
 3. Add a branch to `evalOne()` and a pure predicate function.
 4. Add the kind to `rbac.yaml`, the table in `README.md`, and
@@ -120,7 +120,7 @@ apiserver prunes removed fields such as `spec.strict` from stored Gates.
 5. Table-test the predicate in `main_test.go`, **and add a row to
    `TestEveryCheckTypeDispatches`** covering each option name. A predicate test
    alone is not enough: the option names and GVRs in `evalOne` are string literals
-   hand-matched against `crd.yaml`, and a typo there fails silently — the key lookup
+   hand-matched against `crds/gates.yaml`, and a typo there fails silently — the key lookup
    misses, `numOr`/`boolOr` return the default, and the predicate test still passes
    because it takes the value as an argument.
 
@@ -250,7 +250,7 @@ information.
     needed, that's a reason to add Events rather than to restore the log line.
 14. **Rejected: configurable Gate GVR.** `GATEKEEPER_GATE_{GROUP,VERSION,RESOURCE}`
     were removed. A different group or plural means a different CRD, hence a different
-    `crd.yaml` and ClusterRole, so the knob served a scenario that can't occur.
+    `crds/gates.yaml` and ClusterRole, so the knob served a scenario that can't occur.
 15. **Four reasons read `Degraded`, the rest `Progressing`.** The health check's
     `stuck` table holds `Terminal`, `PolicyViolation`, `ReadForbidden` and
     `InvalidSpec` — every one a verdict that the Gate needs an edit to its spec, to
