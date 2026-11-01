@@ -311,8 +311,32 @@ Four rules that are easy to get wrong:
   after the Gate, not a hook.
 - **A blocked Gate also blocks `prune`.** With `prune: true`, removing a resource
   from Git while the Gate is `False` pins the operation on the Gate's health and the
-  prune never runs, so you can't withdraw a gated resource while its dependency is
-  down.
+  prune never runs — so you can't withdraw a gated resource while its dependency is
+  down *unless you remove the Gate too*. See Removing a Gate below.
+
+### Removing a Gate, or something it gates
+
+**Deleting a Gate from Git always works, even while it reports `False`.** A prune
+waits for the object to be *gone*, not healthy, so a Gate's own readiness is
+irrelevant to its own deletion. Drop `gate.yaml`, sync, done — the resources it was
+gating are left alone.
+
+**To withdraw a gated resource while the dependency is down, remove the Gate in the
+same commit.** That is the whole procedure. It works because Argo CD *reverses* wave
+order for prunes: the wave-`0` workload is deleted before the wave-`-1` Gate, so the
+deletion is never behind the Gate's health. Measured end to end — both resources
+pruned, operation `Succeeded`, in about five seconds.
+
+Two things that will bite you during a teardown:
+
+- **Leave at least one resource in the path.** Argo CD refuses to sync an Application
+  whose source became empty — `auto-sync will wipe out all resources` — so a commit
+  that removes *everything* does nothing at all.
+- **Don't add new resources in the same commit that removes a Gate.** The reversed
+  prune waves are a permutation of the existing wave numbers, not a negation, so they
+  land in the same numeric space as create tasks and can tie with them. A create
+  sharing the Gate's effective wave is not ordered after the Gate's deletion, and if
+  that deletion stalls the create never runs.
 
 ### Confirming it actually gates
 

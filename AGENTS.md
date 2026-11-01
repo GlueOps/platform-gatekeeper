@@ -329,9 +329,25 @@ Verified against upstream, and easy to get wrong:
   so a migration Job — the one workload Decision 2 names as the dangerous
   irreversible case — is completely ungated. Don't put anything in a PreSync hook
   that a Gate is supposed to protect.
-- **A blocked Gate also blocks deletion.** With `prune: true`, removing a resource
-  from Git pins the operation on the Gate's health and the prune never runs, so a
-  gated resource can't be withdrawn while its dependency is down.
+- **A blocked Gate also blocks deletion — unless the Gate goes with it.** With
+  `prune: true`, removing a gated resource from Git while the Gate is `False` pins the
+  operation on the Gate's health and the prune never runs. Removing the Gate *in the
+  same commit* works, and so does removing a Gate on its own: **a prune's wave barrier
+  is "object gone", not "object healthy"**, so a Gate's own `False` never blocks its
+  own deletion. Both measured; README has the procedure.
+  **Why it works, which is not what "reverse prune order" suggests.** `getSyncTasks`
+  in gitops-engine doesn't negate prune waves, it *reflects the sorted list of waves
+  that currently contain prunes onto itself* (odd counts leave the middle fixed). So
+  with prunes at `{-1, 0}` the two swap and the wave-`0` workload is deleted before
+  the wave-`-1` Gate. Three consequences worth knowing:
+  - Effective prune waves are always values already present in that set — prunes at
+    `{-5, 0}` swap to `0` and `-5`, never `5`.
+  - Those values share the numeric space with create/update tasks, so prunes and
+    creates interleave and can tie. **Don't add resources in the same commit that
+    removes a Gate** and assume they're ordered after it.
+  - The overrides are recomputed every pass from whichever prunes are still
+    outstanding, so they aren't stable. It is also why deleting a Gate alone works:
+    as the only prune there is nothing to swap with, and it runs at its natural wave.
 - **`resource.exclusions` matching `gates` silently un-gates everything.** An
   excluded Gate is stripped from the target objects, so it is never applied, never
   produces a sync task, and the next wave runs immediately. The only signal is an
