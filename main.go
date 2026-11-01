@@ -68,8 +68,6 @@ type Server struct {
 	kube kubernetes.Interface
 	dyn  dynamic.Interface
 
-	gateGVR schema.GroupVersionResource
-
 	// platform-mode cross-namespace allowlist
 	platformAllowedNS       []string
 	platformAllowedPrefixes []string
@@ -109,9 +107,8 @@ func main() {
 	}
 
 	s := &Server{
-		kube:    kube,
-		dyn:     dyn,
-		gateGVR: gateGVR,
+		kube: kube,
+		dyn:  dyn,
 		// Empty by default, so a forgotten env var denies rather than allows.
 		platformAllowedNS:       parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES")),
 		platformAllowedPrefixes: parseCSV(os.Getenv("GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES")),
@@ -234,7 +231,7 @@ func (s *Server) reconcileLoop(ctx context.Context) {
 func (s *Server) reconcileOnce(ctx context.Context) {
 	started := time.Now()
 
-	list, err := s.dyn.Resource(s.gateGVR).Namespace("").List(ctx, metav1.ListOptions{})
+	list, err := s.dyn.Resource(gateGVR).Namespace("").List(ctx, metav1.ListOptions{})
 	if err != nil {
 		log.Printf("sweep: list gates: %v", err)
 		return
@@ -913,7 +910,7 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 		return fmt.Errorf("marshal status patch: %w", err)
 	}
 
-	_, err = s.dyn.Resource(s.gateGVR).Namespace(gate.GetNamespace()).Patch(
+	_, err = s.dyn.Resource(gateGVR).Namespace(gate.GetNamespace()).Patch(
 		ctx, gate.GetName(), types.MergePatchType, b, metav1.PatchOptions{}, "status",
 	)
 	return err

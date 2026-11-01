@@ -861,7 +861,6 @@ func newTestServer(t *testing.T, mode string, kubeObjs []runtime.Object, dynObjs
 	return &Server{
 		kube:                    kube,
 		dyn:                     dyn,
-		gateGVR:                 testGateGVR,
 		platformAllowedNS:       []string{"glueops-core"},
 		platformAllowedPrefixes: []string{"glueops-core-"},
 		reconcileInterval:       time.Second,
@@ -879,7 +878,7 @@ func unstructuredObj(apiVersion, kind, ns, name string, status map[string]any) *
 
 func readyConditionFields(t *testing.T, s *Server, ns, name string) (status, reason, message, transition string) {
 	t.Helper()
-	got, err := s.dyn.Resource(s.gateGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
+	got, err := s.dyn.Resource(gateGVR).Namespace(ns).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("get gate: %v", err)
 	}

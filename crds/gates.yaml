@@ -60,11 +60,16 @@ spec:
                     # Catches a misspelled check type, which pruning would other-
                     # wise turn into a check that silently verifies nothing.
                     x-kubernetes-validations:
-                      - rule: >-
+                      # |- with every line at the block indent, not >-: a folded
+                      # scalar whose continuations are indented further keeps literal
+                      # newlines, and kustomize then re-emits it with an extra one, so
+                      # the bundle and a direct kubectl apply install different rule
+                      # strings and flip the field on every apply.
+                      - rule: |-
                           [has(self.deploymentAvailable), has(self.statefulSetReady),
-                           has(self.jobComplete), has(self.serviceReadyEndpoints),
-                           has(self.podLabelReady), has(self.argoApplicationHealthy),
-                           has(self.fluxHelmReleaseReady)].exists_one(x, x)
+                          has(self.jobComplete), has(self.serviceReadyEndpoints),
+                          has(self.podLabelReady), has(self.argoApplicationHealthy),
+                          has(self.fluxHelmReleaseReady)].exists_one(x, x)
                         message: "each check must set exactly one check type"
                     properties:
                       id:
