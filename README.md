@@ -338,6 +338,22 @@ Two things that will bite you during a teardown:
   sharing the Gate's effective wave is not ordered after the Gate's deletion, and if
   that deletion stalls the create never runs.
 
+**If you need to keep the Gate but stop it blocking:** delete its
+`argocd.argoproj.io/sync-wave` annotation in Git. The Gate then shares the default
+wave, gates nothing, and prunes proceed normally. It's a Git-side change, so no drift,
+and putting the annotation back restores gating. The cost is that the Gate stays in
+the tree reporting `Progressing`, so the Application never reads Healthy again until
+its dependency recovers.
+
+**What not to reach for.** All four measured:
+
+| Attempt | Result |
+| --- | --- |
+| `argocd app sync --prune` | **Does nothing, and looks like it's working.** It builds the same task list as auto-sync, so the wave-`-1` Gate blocks it identically — the operation sits at `Running`, not `Failed`. This is the first thing most people try |
+| `argocd app sync --prune --resource apps:Deployment:<ns>/<name>` | Works — a targeted prune drops the Gate from the task list entirely. But you must disable `automated` and terminate the stuck operation first, and it's imperative drift until the Git removal follows |
+| `kubectl delete` the gated resource | Half-works, then strands you. The resource stays gone, but the Application is left `OutOfSync/Progressing` with an operation pending indefinitely — it looks broken rather than deliberately withdrawn |
+| `kubectl delete` the Gate | **Pointless with `selfHeal: true`.** It's the wave-`-1` task selfHeal applies first, so it's back within seconds — and a freshly created Gate has no status, which the health check reads as `Progressing / "Awaiting first evaluation"`, so it blocks immediately rather than briefly passing |
+
 ### Confirming it actually gates
 
 The failure mode to rule out is a Gate that exists but gates nothing — a missing
