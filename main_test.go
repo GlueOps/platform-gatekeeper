@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -11,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
@@ -126,6 +129,22 @@ func TestDeploymentReady(t *testing.T) {
 			deploy: &appsv1.Deployment{
 				Status: appsv1.DeploymentStatus{
 					AvailableReplicas: 2,
+				},
+			},
+			minAvail:  1,
+			wantReady: false,
+		},
+		{
+			// Available=True left over from before the spec changed.
+			name: "status from an older generation",
+			deploy: &appsv1.Deployment{
+				ObjectMeta: metav1.ObjectMeta{Generation: 2},
+				Status: appsv1.DeploymentStatus{
+					ObservedGeneration: 1,
+					AvailableReplicas:  2,
+					Conditions: []appsv1.DeploymentCondition{
+						{Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue},
+					},
 				},
 			},
 			minAvail:  1,
@@ -974,6 +993,26 @@ func TestTransientErrorYieldsUnknownNotFalse(t *testing.T) {
 	}
 }
 
+// The raw error carries the API server URL, and status reaches the Argo CD UI.
+func TestReadErrorIsNotEchoed(t *testing.T) {
+	gate := testGate("nonprod", "app", 1, map[string]any{
+		"id":                  "db",
+		"deploymentAvailable": map[string]any{"name": "postgres"},
+	})
+	s := newTestServer(t, "", nil, gate)
+	kube := s.kube.(*kubefake.Clientset)
+	kube.PrependReactor("get", "deployments", func(k8stesting.Action) (bool, runtime.Object, error) {
+		return true, nil, fmt.Errorf(`Get "https://10.0.0.1:443/apis/apps/v1": %w`, context.DeadlineExceeded)
+	})
+
+	s.reconcileOnce(context.Background())
+
+	_, _, message, _ := readyConditionFields(t, s, "nonprod", "app")
+	if strings.Contains(message, "10.0.0.1") || !strings.Contains(message, "(Timeout)") {
+		t.Errorf("message = %q, want the reason without the raw error", message)
+	}
+}
+
 func TestForbiddenReadIsDistinctFromNotReady(t *testing.T) {
 	gate := testGate("nonprod", "app", 1, map[string]any{
 		"id":                  "db",
@@ -1218,6 +1257,11 @@ func TestTruncate(t *testing.T) {
 	}
 	if !strings.HasSuffix(got, "...") {
 		t.Errorf("truncated message should end in an ellipsis, got %q", got[len(got)-10:])
+	}
+
+	multi := truncate(strings.Repeat("é", maxMessageLen))
+	if !utf8.ValidString(multi) || len(multi) > maxMessageLen {
+		t.Errorf("truncate split a multi-byte character or overran: len=%d valid=%v", len(multi), utf8.ValidString(multi))
 	}
 }
 
@@ -1525,6 +1569,41 @@ func TestSweepSuccessAccounting(t *testing.T) {
 
 		if s.lastSweep.Load() != 0 {
 			t.Error("lastSweep was stamped on a sweep where every patch 404'd")
+		}
+	})
+
+	// The write carries the listed resourceVersion, so a Gate edited or recreated
+	// mid-sweep 409s; that's skipped, not a failure.
+	t.Run("a conflicting write is skipped and does not withhold the stamp", func(t *testing.T) {
+		other := testGate("nonprod", "other", 1, map[string]any{
+			"id":                  "db",
+			"deploymentAvailable": map[string]any{"name": "d"},
+		})
+		g := newGate()
+		g.SetResourceVersion("41")
+		s := newTestServer(t, "", []runtime.Object{deploymentWithAvailable("nonprod", "d", 1)}, g, other)
+		dyn := s.dyn.(*dynamicfake.FakeDynamicClient)
+		var sentRV any
+		dyn.PrependReactor("patch", "gates", func(a k8stesting.Action) (bool, runtime.Object, error) {
+			p := a.(k8stesting.PatchAction)
+			if p.GetName() != "g" {
+				return false, nil, nil
+			}
+			var body map[string]any
+			if err := json.Unmarshal(p.GetPatch(), &body); err != nil {
+				t.Fatalf("patch is not JSON: %v", err)
+			}
+			sentRV, _, _ = unstructured.NestedFieldNoCopy(body, "metadata", "resourceVersion")
+			return true, nil, apierrors.NewConflict(schema.GroupResource{Resource: "gates"}, "g", errors.New("modified"))
+		})
+
+		s.reconcileOnce(context.Background())
+
+		if sentRV != "41" {
+			t.Errorf("patch resourceVersion = %v, want the listed 41", sentRV)
+		}
+		if s.lastSweep.Load() == 0 {
+			t.Error("a conflict is a skip, so the sweep should still be stamped")
 		}
 	})
 

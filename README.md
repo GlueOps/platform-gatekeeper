@@ -459,7 +459,8 @@ requires platform mode (below).
 
 ### `deploymentAvailable`
 
-Deployment is `Available` with at least N available replicas.
+Deployment is `Available` with at least N available replicas, and its status is
+current (`observedGeneration` has caught up with `generation`).
 
 ```yaml
 - id: api
