@@ -450,6 +450,18 @@ func TestArgoAppReadyWaitsForOperations(t *testing.T) {
 			st["operationState"] = opState("Succeeded", later, true)
 			st["reconciledAt"] = earlier
 		}), true, true, true, false},
+		{"last sync failed", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Failed", earlier, false)
+			st["reconciledAt"] = later
+		}), true, true, false, false},
+		{"last sync errored, only health required", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Error", earlier, false)
+			st["reconciledAt"] = later
+		}), false, true, false, false},
+		{"failed dry run is never waited on", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Failed", earlier, true)
+			st["reconciledAt"] = later
+		}), true, true, true, false},
 		{"being deleted", app(func(o, _ map[string]any) {
 			o["metadata"].(map[string]any)["deletionTimestamp"] = earlier
 		}), true, true, false, false},
@@ -480,7 +492,7 @@ func TestArgoAppReadyWaitsForOperations(t *testing.T) {
 				t.Errorf("ready = %v (%q), want %v", ready, msg, tt.wantReady)
 			}
 			if terminal {
-				t.Error("an in-progress operation must never be terminal")
+				t.Error("an operation's state must never be terminal")
 			}
 			if (err != nil) != tt.wantErr {
 				t.Errorf("err = %v, wantErr %v", err, tt.wantErr)

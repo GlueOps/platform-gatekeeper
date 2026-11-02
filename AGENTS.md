@@ -378,6 +378,10 @@ Verified against upstream, and easy to get wrong:
   `argoApplicationHealthy` also requires no operation requested, running, or
   finished-but-unreconciled — the rule `argocd app wait` applies. Health and sync
   alone release a Gate before its dependency has finished syncing.
+  A last sync that ended in any phase but `Succeeded` also blocks (dry runs aside),
+  because a failed PostSync hook leaves the Application `Synced` and `Healthy`. It is
+  not `Terminal`, but nothing re-syncs a `Synced` app on its own: recovery is a manual
+  sync, or a commit that changes a non-hook resource.
 - **A wedged Application can read `Healthy`.** Measured: after the dependency was
   fixed, the Application showed `health=Healthy` with `sync=OutOfSync` and the gated
   Deployment absent — the Gate was the only live resource, so the rollup followed it.
