@@ -336,6 +336,13 @@ Verified against upstream, and easy to get wrong:
   and the sync succeeds ~35s later even with `selfHeal: false`; fix it after and
   neither setting recovers. The way out then is a manual sync (works at the same
   revision) or a new commit.
+- **Mid-sync an Application already reads `Synced` and `Healthy`.** Measured: re-syncing
+  an already-synced, hooked, multi-wave app, sync and health never left
+  `Synced`/`Healthy` for the whole time `operationState.phase` was `Running` (a first
+  sync does go `OutOfSync` first). So
+  `argoApplicationHealthy` also requires no operation requested, running, or
+  finished-but-unreconciled — the rule `argocd app wait` applies. Health and sync
+  alone release a Gate before its dependency has finished syncing.
 - **A wedged Application can read `Healthy`.** Measured: after the dependency was
   fixed, the Application showed `health=Healthy` with `sync=OutOfSync` and the gated
   Deployment absent — the Gate was the only live resource, so the rollup followed it.

@@ -751,9 +751,7 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), false, nil
 }
 
-// Mirrors checkAppWaitConditions in argo-cd's `argocd app wait`: mid-sync an
-// Application already reads Synced and Healthy while later waves and hooks are
-// still pending, and right after one its status predates the final reconcile.
+// Mirrors checkAppWaitConditions in `argocd app wait`; see AGENTS.md for why.
 func argoOperationInProgress(app *unstructured.Unstructured) (bool, string, error) {
 	if _, requested := app.Object["operation"]; requested {
 		return true, "sync operation requested", nil
@@ -784,12 +782,11 @@ func argoOperationInProgress(app *unstructured.Unstructured) (bool, string, erro
 	if err != nil {
 		return false, "", fmt.Errorf("status.reconciledAt has unexpected type: %w", err)
 	}
-	if reconciledAt == "" {
-		return true, "awaiting reconcile after sync", nil
-	}
-	reconciled, err := time.Parse(time.RFC3339, reconciledAt)
-	if err != nil {
-		return false, "", fmt.Errorf("status.reconciledAt is not a timestamp: %w", err)
+	var reconciled time.Time
+	if reconciledAt != "" {
+		if reconciled, err = time.Parse(time.RFC3339, reconciledAt); err != nil {
+			return false, "", fmt.Errorf("status.reconciledAt is not a timestamp: %w", err)
+		}
 	}
 	if reconciled.Before(finished) {
 		return true, "awaiting reconcile after sync", nil
