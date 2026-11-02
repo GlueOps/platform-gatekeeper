@@ -83,12 +83,8 @@ Then point an Application at a copy of `examples/wave-gating/` in a repo you con
 (the shipped `repoURL` is a placeholder) with its dependency scaled to 0, and confirm
 the sync holds at wave `-1`.
 
-Two things make a gating test silently measure nothing, both of which cost real time
-here: `argocd.argoproj.io/ignore-healthcheck` left on the Gate, and the `:latest` tag
-in `deploy.yaml` — the apiserver defaults `imagePullPolicy` to `Always` for a floating
-tag and the policy stays in the pod spec afterwards, so a later `kubectl set image` to
-a locally imported tag still tries to pull from the registry and fails. Patch the
-policy to `IfNotPresent` when testing imported builds.
+One thing makes a gating test silently measure nothing, and it cost real time here:
+`argocd.argoproj.io/ignore-healthcheck` left on the Gate.
 
 The CRD schema changed incompatibly without a version bump, which `v1alpha1`
 permits. The version never leaves `spec.versions`, so there is no
@@ -247,6 +243,15 @@ information.
     it promotes themselves to platform mode. That means `patch` AND `update` on an
     existing namespace, and `create` of a new one -- an RBAC review looking only for
     `patch` misses two of the three.
+    **Argo CD can set it on a tenant's behalf** — an Application with
+    `CreateNamespace=true` and `managedNamespaceMetadata.labels` — but only in a
+    project that permits the cluster-scoped `Namespace` kind. Measured on v3.5.6: a
+    project without it refuses the sync, for a new namespace and an existing one
+    alike. So tenant AppProjects must keep `Namespace` out of their cluster-resource
+    whitelist (the GlueOps tenant template blacklists every cluster-scoped kind) and
+    must never list a platform-mode namespace as a destination. Requiring
+    platform-mode Gates to live in an allowlisted namespace would not help: tenant
+    environment namespaces are allowlisted targets.
 11. **A Gate must express steady state, not an event.** It is a managed resource in
     wave `-1` of *every* sync, re-evaluated each time — not a one-shot precondition.
     So the gated condition has to stay true for the life of the Application. Gating
@@ -309,6 +314,33 @@ information.
     every check field, `required: ["checks"]`, `items: type: object`, and the CEL
     rule block every path that emits it); it is in the table for uniformity, so the
     rule reads as one sentence rather than a list of exceptions.
+16. **Accepted: gatekeeper's ClusterRole is every Gate author's read permission.**
+    This is what removing per-caller SubjectAccessReview costs, beyond Decision 13's
+    audit attribution:
+    - Anyone who can create or update a Gate learns, for every kind in `rbac.yaml`
+      that the Gate can reach, whether a named object exists, its replica, pod and
+      endpoint counts, whether pods match an arbitrary selector (so label values can
+      be probed), Job and Flux condition reasons, and Argo CD health and sync — all
+      in `status.results`, readable by anyone who can read the Gate.
+    - The cross-namespace limit is one layer, the mode label plus the allowlist
+      (Decision 10), where SAR used to be a second.
+    - Widening `rbac.yaml` grants every Gate author at once. Review it as a
+      tenant-facing privilege change, not internal plumbing.
+    - `create gates` is effectively read access to those kinds, so never aggregate
+      `gates` into the `edit` or `admin` roles.
+    **Deferred:** a `ValidatingAdmissionPolicy` calling `authorizer` to check the
+    Gate author's own RBAC at write time. Under GitOps the requester is Argo CD's
+    controller, not the tenant, unless AppProjects use `destinationServiceAccounts`,
+    which these don't.
+17. **Settled in review.**
+    - **Rejected: duplicate check ids wedging status writes after the upgrade.**
+      Measured: a Gate stored under the old CRD with two `id: db` checks kept being
+      written (`0 failed`), because validation ratcheting accepts the duplicates on an
+      object that already had them; a new Gate is rejected at create.
+    - **Deferred: one Gate's persistently failing status write withholds `lastSweep`
+      and `/readyz` cluster-wide.** With NotFound and Conflict skipped, the only
+      trigger found is a deliberately oversized Gate near the object size limit.
+      `maxLength` on `name` and `selector` would close it, at the cost of a CRD change.
 
 ## Ownership
 
