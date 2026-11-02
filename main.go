@@ -304,6 +304,7 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 				return metav1.ConditionFalse, s.writeStatus(writeCtx, gate, metav1.ConditionFalse,
 					reasonReadForbidden, "namespace read forbidden: grant core/namespaces get in gatekeeper's ClusterRole", nil)
 			}
+			log.Printf("namespace %s mode lookup: %v", ns, modeErr)
 			return metav1.ConditionUnknown, s.writeStatus(writeCtx, gate, metav1.ConditionUnknown,
 				reasonEvaluationFailed, "namespace mode lookup failed", nil)
 		}
@@ -922,9 +923,7 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 	}
 
 	patch := map[string]any{"status": statusObj}
-	// A precondition: if the Gate was edited, or deleted and recreated under the same
-	// name, since the List, the write 409s instead of landing a verdict for a spec
-	// it never saw. A UID in a status patch is silently ignored; this is not.
+	// 409s if the Gate changed or was recreated since the List; a UID here is ignored.
 	if rv := gate.GetResourceVersion(); rv != "" {
 		patch["metadata"] = map[string]any{"resourceVersion": rv}
 	}

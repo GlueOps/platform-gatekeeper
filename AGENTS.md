@@ -84,7 +84,9 @@ Then point an Application at a copy of `examples/wave-gating/` in a repo you con
 the sync holds at wave `-1`.
 
 One thing makes a gating test silently measure nothing, and it cost real time here:
-`argocd.argoproj.io/ignore-healthcheck` left on the Gate.
+`argocd.argoproj.io/ignore-healthcheck` left on the Gate. And a cluster that once ran
+the old `:latest` manifest keeps `imagePullPolicy: Always`, so patch it to
+`IfNotPresent` before `kubectl set image` to an imported build.
 
 The CRD schema changed incompatibly without a version bump, which `v1alpha1`
 permits. The version never leaves `spec.versions`, so there is no
@@ -321,7 +323,8 @@ information.
       that the Gate can reach, whether a named object exists, its replica, pod and
       endpoint counts, whether pods match an arbitrary selector (so label values can
       be probed), Job and Flux condition reasons, and Argo CD health and sync — all
-      in `status.results`, readable by anyone who can read the Gate.
+      in `status.results`, readable by anyone who can read the Gate, and in the
+      Ready message the Argo CD UI shows to anyone the AppProject lets see the app.
     - The cross-namespace limit is one layer, the mode label plus the allowlist
       (Decision 10), where SAR used to be a second.
     - Widening `rbac.yaml` grants every Gate author at once. Review it as a

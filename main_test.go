@@ -993,7 +993,6 @@ func TestTransientErrorYieldsUnknownNotFalse(t *testing.T) {
 	}
 }
 
-// The raw error carries the API server URL, and status reaches the Argo CD UI.
 func TestReadErrorIsNotEchoed(t *testing.T) {
 	gate := testGate("nonprod", "app", 1, map[string]any{
 		"id":                  "db",
@@ -1572,8 +1571,6 @@ func TestSweepSuccessAccounting(t *testing.T) {
 		}
 	})
 
-	// The write carries the listed resourceVersion, so a Gate edited or recreated
-	// mid-sweep 409s; that's skipped, not a failure.
 	t.Run("a conflicting write is skipped and does not withhold the stamp", func(t *testing.T) {
 		other := testGate("nonprod", "other", 1, map[string]any{
 			"id":                  "db",
