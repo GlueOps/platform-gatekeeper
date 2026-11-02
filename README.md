@@ -459,7 +459,8 @@ requires platform mode (below).
 
 ### `deploymentAvailable`
 
-Deployment is `Available` with at least N available replicas.
+Deployment is `Available` with at least N available replicas, and its status is
+current (`observedGeneration` has caught up with `generation`).
 
 ```yaml
 - id: api
@@ -658,7 +659,9 @@ allowlisted. The message names the target.
 
 **A Gate says `EvaluationFailed`.** Gatekeeper couldn't complete a read — usually a
 transient API error. The condition is `Unknown` rather than `False` on purpose: it is
-not a claim that the dependency is unready.
+not a claim that the dependency is unready. The message carries only the API error's
+reason (`Timeout`, `ServiceUnavailable`, …); the full error is in gatekeeper's log:
+`kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper | grep read`.
 
 **A sync hangs and the Gate looks healthy.** Check that the Lua health check from
 step 3 is actually installed; without it Argo CD ignores the Gate entirely, the wave

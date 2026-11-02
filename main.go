@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"math/rand"
@@ -13,6 +14,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/joho/godotenv"
 	appsv1 "k8s.io/api/apps/v1"
@@ -245,9 +247,10 @@ func (s *Server) reconcileOnce(ctx context.Context) {
 		gate := &list.Items[i]
 		status, err := s.reconcileGate(ctx, gate, modes)
 		if err != nil {
-			// Deleted mid-sweep is not a failure. The wrote > 0 check below is
-			// what catches a CRD with no status subresource 404ing every patch.
-			if !apierrors.IsNotFound(err) {
+			// Deleted, edited or recreated mid-sweep is not a failure; the next sweep
+			// re-lists it. The wrote > 0 check below is what catches a CRD with no
+			// status subresource 404ing every patch.
+			if !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 				failed++
 				log.Printf("sweep: gate %s/%s: %v", gate.GetNamespace(), gate.GetName(), err)
 			}
@@ -301,6 +304,7 @@ func (s *Server) reconcileGate(ctx context.Context, gate *unstructured.Unstructu
 				return metav1.ConditionFalse, s.writeStatus(writeCtx, gate, metav1.ConditionFalse,
 					reasonReadForbidden, "namespace read forbidden: grant core/namespaces get in gatekeeper's ClusterRole", nil)
 			}
+			log.Printf("namespace %s mode lookup: %v", ns, modeErr)
 			return metav1.ConditionUnknown, s.writeStatus(writeCtx, gate, metav1.ConditionUnknown,
 				reasonEvaluationFailed, "namespace mode lookup failed", nil)
 		}
@@ -647,13 +651,28 @@ func readErr(id, what, rule string, err error) EvalResult {
 			Message: truncate(fmt.Sprintf("gatekeeper cannot read %s: grant %s in its ClusterRole", what, rule)),
 		}
 	default:
-		return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(fmt.Sprintf("%s read failed: %v", what, err))}
+		// The raw error names the API server URL, and status reaches the Argo CD UI.
+		log.Printf("read %s: %v", what, err)
+		return EvalResult{ID: id, Reason: reasonEvaluationFailed, Message: truncate(fmt.Sprintf("%s read failed (%s)", what, errorReason(err)))}
 	}
+}
+
+func errorReason(err error) string {
+	if r := apierrors.ReasonForError(err); r != metav1.StatusReasonUnknown {
+		return string(r)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return "Timeout"
+	}
+	return "Unknown"
 }
 
 // --- readiness helpers
 
 func deploymentReady(d *appsv1.Deployment, minAvail int64) (bool, string) {
+	if d.Status.ObservedGeneration < d.Generation {
+		return false, fmt.Sprintf("status is stale (observedGeneration %d < generation %d)", d.Status.ObservedGeneration, d.Generation)
+	}
 	avail := int64(d.Status.AvailableReplicas)
 	if avail < minAvail {
 		return false, fmt.Sprintf("availableReplicas %d < %d", avail, minAvail)
@@ -956,6 +975,10 @@ func (s *Server) writeStatus(ctx context.Context, gate *unstructured.Unstructure
 	}
 
 	patch := map[string]any{"status": statusObj}
+	// 409s if the Gate changed or was recreated since the List; a UID here is ignored.
+	if rv := gate.GetResourceVersion(); rv != "" {
+		patch["metadata"] = map[string]any{"resourceVersion": rv}
+	}
 
 	b, err := json.Marshal(patch)
 	if err != nil {
@@ -1016,7 +1039,11 @@ func truncate(s string) string {
 	if len(s) <= maxMessageLen {
 		return s
 	}
-	return s[:maxMessageLen-3] + "..."
+	cut := maxMessageLen - 3
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // Drops empty entries: a trailing comma must not yield an empty prefix, which
