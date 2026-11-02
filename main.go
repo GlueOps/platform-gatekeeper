@@ -770,8 +770,7 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), false, nil
 }
 
-// Mirrors checkAppWaitConditions in `argocd app wait`, plus a failed last sync
-// blocks; see AGENTS.md for why.
+// Mirrors checkAppWaitConditions in `argocd app wait`; see AGENTS.md for why.
 func argoOperationInProgress(app *unstructured.Unstructured) (bool, string, error) {
 	if _, requested := app.Object["operation"]; requested {
 		return true, "sync operation requested", nil
@@ -787,16 +786,12 @@ func argoOperationInProgress(app *unstructured.Unstructured) (bool, string, erro
 	if err != nil {
 		return false, "", fmt.Errorf("status.operationState.finishedAt has unexpected type: %w", err)
 	}
-	phase, _, _ := unstructured.NestedString(op, "phase")
 	if finishedAt == "" {
+		phase, _, _ := unstructured.NestedString(op, "phase")
 		return true, fmt.Sprintf("sync operation %s", orNone(phase)), nil
 	}
 	if dryRun, _, _ := unstructured.NestedBool(op, "operation", "sync", "dryRun"); dryRun {
 		return false, "", nil
-	}
-	// Failed/Error also cover a terminated sync; a later successful sync clears it.
-	if phase != "Succeeded" {
-		return true, fmt.Sprintf("last sync %s", orNone(phase)), nil
 	}
 	finished, err := time.Parse(time.RFC3339, finishedAt)
 	if err != nil {

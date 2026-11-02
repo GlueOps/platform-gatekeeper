@@ -540,13 +540,9 @@ Also not ready while the Application has a sync operation requested or running, 
 has just finished one it hasn't re-checked yet — the same rule `argocd app wait`
 uses. Mid-sync an Application already reads `Synced` and `Healthy` while its later
 waves and hooks are still pending, so health and sync alone would release the Gate
-early. An Application whose last sync failed, errored or was terminated is not
-ready until a later sync succeeds, and neither is one being deleted. So a
-dependency whose sync is stuck `Running` or ended `Failed` blocks every Gate on it
-even while it reads `Healthy` and `Synced`; check its operation state, not just its
-health. Argo CD auto-syncs only an `OutOfSync` Application, so after a failed hook (which
-leaves it `Synced`) the Gate stays blocked until you sync the dependency by hand or
-commit a change to one of its non-hook resources.
+early. An Application being deleted is not ready either. So a dependency whose sync
+is stuck `Running` blocks every Gate on it even while it reads `Healthy` and
+`Synced`; check its operation state, not just its health.
 
 Nothing here is reported as `Terminal`. Argo CD health is a rollup over an
 Application's resources rather than a statement that its controller stopped trying:
