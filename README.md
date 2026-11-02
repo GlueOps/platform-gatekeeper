@@ -536,6 +536,14 @@ Argo CD Application is Healthy and/or Synced.
     requireHealthy: true   # default true
 ```
 
+Also not ready while the Application has a sync operation requested or running, or
+has just finished one it hasn't re-checked yet — the same rule `argocd app wait`
+uses. Mid-sync an Application already reads `Synced` and `Healthy` while its later
+waves and hooks are still pending, so health and sync alone would release the Gate
+early. An Application being deleted is not ready either. So a dependency whose sync
+is stuck `Running` blocks every Gate on it even while it reads `Healthy` and
+`Synced`; check its operation state, not just its health.
+
 Nothing here is reported as `Terminal`. Argo CD health is a rollup over an
 Application's resources rather than a statement that its controller stopped trying:
 `Progressing` and `Degraded` both occur mid-rollout, and `Missing` is simply an

@@ -388,6 +388,107 @@ func TestArgoAppReady(t *testing.T) {
 	})
 }
 
+func TestArgoAppReadyWaitsForOperations(t *testing.T) {
+	const earlier, later = "2026-01-01T00:00:00Z", "2026-01-01T00:00:05Z"
+	app := func(mutate func(obj map[string]any, status map[string]any)) *unstructured.Unstructured {
+		status := map[string]any{
+			"health": map[string]any{"status": "Healthy"},
+			"sync":   map[string]any{"status": "Synced"},
+		}
+		obj := map[string]any{"metadata": map[string]any{"name": "dep"}, "status": status}
+		mutate(obj, status)
+		return &unstructured.Unstructured{Object: obj}
+	}
+	opState := func(phase, finishedAt string, dryRun bool) map[string]any {
+		op := map[string]any{"phase": phase, "operation": map[string]any{"sync": map[string]any{"dryRun": dryRun}}}
+		if finishedAt != "" {
+			op["finishedAt"] = finishedAt
+		}
+		return op
+	}
+
+	tests := []struct {
+		name           string
+		app            *unstructured.Unstructured
+		requireSynced  bool
+		requireHealthy bool
+		wantReady      bool
+		wantErr        bool
+	}{
+		{"never synced", app(func(_, _ map[string]any) {}), true, true, true, false},
+		{"operation requested, not started", app(func(o, _ map[string]any) {
+			o["operation"] = map[string]any{"sync": map[string]any{}}
+		}), true, true, false, false},
+		{"operation running", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Running", "", false)
+		}), true, true, false, false},
+		{"operation running, only health required", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Running", "", false)
+		}), false, true, false, false},
+		{"operation running, only sync required", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Running", "", false)
+		}), true, false, false, false},
+		{"operation running, nothing required", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Running", "", false)
+		}), false, false, true, false},
+		{"finished, not yet reconciled", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", later, false)
+			st["reconciledAt"] = earlier
+		}), true, true, false, false},
+		{"finished, reconciledAt absent", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", later, false)
+		}), true, true, false, false},
+		{"finished and reconciled after", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", earlier, false)
+			st["reconciledAt"] = later
+		}), true, true, true, false},
+		{"finished and reconciled in the same second", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", later, false)
+			st["reconciledAt"] = later
+		}), true, true, true, false},
+		{"dry run is never waited on", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", later, true)
+			st["reconciledAt"] = earlier
+		}), true, true, true, false},
+		{"being deleted", app(func(o, _ map[string]any) {
+			o["metadata"].(map[string]any)["deletionTimestamp"] = earlier
+		}), true, true, false, false},
+		{"malformed finishedAt", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", "yesterday", false)
+			st["reconciledAt"] = later
+		}), true, true, false, true},
+		{"malformed reconciledAt", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", earlier, false)
+			st["reconciledAt"] = "yesterday"
+		}), true, true, false, true},
+		{"finishedAt wrong type", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", "", false)
+			st["operationState"].(map[string]any)["finishedAt"] = int64(5)
+		}), true, true, false, true},
+		{"reconciledAt wrong type", app(func(_, st map[string]any) {
+			st["operationState"] = opState("Succeeded", earlier, false)
+			st["reconciledAt"] = int64(5)
+		}), true, true, false, true},
+		{"malformed operationState", app(func(_, st map[string]any) {
+			st["operationState"] = "Running"
+		}), true, true, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ready, msg, terminal, err := argoAppReady(tt.app, tt.requireSynced, tt.requireHealthy)
+			if ready != tt.wantReady {
+				t.Errorf("ready = %v (%q), want %v", ready, msg, tt.wantReady)
+			}
+			if terminal {
+				t.Error("an in-progress operation must never be terminal")
+			}
+			if (err != nil) != tt.wantErr {
+				t.Errorf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
 // --- fluxHelmReleaseReady ---
 
 func TestFluxHelmReleaseReady(t *testing.T) {
