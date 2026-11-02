@@ -702,6 +702,19 @@ func jobComplete(j *batchv1.Job) (ready bool, msg string, terminal bool) {
 // Nothing here is terminal: Argo CD health is a rollup over an Application's
 // resources, not a controller giving up. See AGENTS.md Decision 6.
 func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy bool) (ready bool, msg string, terminal bool, err error) {
+	if !requireHealthy && !requireSynced {
+		return true, "no conditions required", false, nil
+	}
+
+	if app.GetDeletionTimestamp() != nil {
+		return false, "application is being deleted", false, nil
+	}
+	if busy, why, opErr := argoOperationInProgress(app); opErr != nil {
+		return false, "", false, opErr
+	} else if busy {
+		return false, why, false, nil
+	}
+
 	if requireHealthy {
 		healthStatus, found, nestedErr := unstructured.NestedString(app.Object, "status", "health", "status")
 		if nestedErr != nil {
@@ -728,10 +741,6 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 		}
 	}
 
-	if !requireHealthy && !requireSynced {
-		return true, "no conditions required", false, nil
-	}
-
 	var parts []string
 	if requireHealthy {
 		parts = append(parts, "Healthy")
@@ -740,6 +749,52 @@ func argoAppReady(app *unstructured.Unstructured, requireSynced, requireHealthy 
 		parts = append(parts, "Synced")
 	}
 	return true, fmt.Sprintf("argo application %s", strings.Join(parts, " and ")), false, nil
+}
+
+// Mirrors checkAppWaitConditions in argo-cd's `argocd app wait`: mid-sync an
+// Application already reads Synced and Healthy while later waves and hooks are
+// still pending, and right after one its status predates the final reconcile.
+func argoOperationInProgress(app *unstructured.Unstructured) (bool, string, error) {
+	if _, requested := app.Object["operation"]; requested {
+		return true, "sync operation requested", nil
+	}
+	op, found, err := unstructured.NestedMap(app.Object, "status", "operationState")
+	if err != nil {
+		return false, "", fmt.Errorf("status.operationState has unexpected type: %w", err)
+	}
+	if !found {
+		return false, "", nil
+	}
+	finishedAt, _, err := unstructured.NestedString(op, "finishedAt")
+	if err != nil {
+		return false, "", fmt.Errorf("status.operationState.finishedAt has unexpected type: %w", err)
+	}
+	if finishedAt == "" {
+		phase, _, _ := unstructured.NestedString(op, "phase")
+		return true, fmt.Sprintf("sync operation %s", orNone(phase)), nil
+	}
+	if dryRun, _, _ := unstructured.NestedBool(op, "operation", "sync", "dryRun"); dryRun {
+		return false, "", nil
+	}
+	finished, err := time.Parse(time.RFC3339, finishedAt)
+	if err != nil {
+		return false, "", fmt.Errorf("status.operationState.finishedAt is not a timestamp: %w", err)
+	}
+	reconciledAt, _, err := unstructured.NestedString(app.Object, "status", "reconciledAt")
+	if err != nil {
+		return false, "", fmt.Errorf("status.reconciledAt has unexpected type: %w", err)
+	}
+	if reconciledAt == "" {
+		return true, "awaiting reconcile after sync", nil
+	}
+	reconciled, err := time.Parse(time.RFC3339, reconciledAt)
+	if err != nil {
+		return false, "", fmt.Errorf("status.reconciledAt is not a timestamp: %w", err)
+	}
+	if reconciled.Before(finished) {
+		return true, "awaiting reconcile after sync", nil
+	}
+	return false, "", nil
 }
 
 // fluxHelmReleaseReady checks generation currency first (a lagging
