@@ -1,35 +1,67 @@
+# Reference for every supported check type.
+#
+# AS WRITTEN THIS NEEDS A PLATFORM-MODE NAMESPACE. The cert-manager check targets
+# another namespace, and in customer mode (the default) that is refused: measured,
+# the Gate reports `PolicyViolation -- cross-namespace checks not allowed in customer
+# mode`, which maps to Argo CD Degraded and FAILS the sync. Either drop that check or
+# put the Gate in a platform-mode namespace -- see observability-stack-gate.yaml,
+# which lives in glueops-core-gatekeeper.
+#
+# Each check sets exactly one type --
+# the CRD rejects a check that sets none or more than one, which is also what
+# catches a misspelled type name (the API server prunes unknown fields, so a typo
+# would otherwise leave a check that silently verifies nothing).
 apiVersion: platform.glueops.dev/v1alpha1
 kind: Gate
 metadata:
   name: full-stack-ready
   namespace: nonprod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
 spec:
-  strict: true
   checks:
     - id: database
       statefulSetReady:
         name: postgres
         minReadyReplicas: 1
         requireUpdatedRevision: true
+
+    # jobComplete is shown for completeness, but think twice before gating on it:
+    # a Gate is re-evaluated on every sync, so once the Job is garbage-collected
+    # this check reports not-found forever and blocks every later sync. See the
+    # note in examples/wave-gating/gate.yaml.
     - id: migration
       jobComplete:
         name: db-migrate
+
     - id: cache
       serviceReadyEndpoints:
         name: redis
         minReadyAddresses: 1
+
     - id: api
       deploymentAvailable:
         name: api-server
         minAvailableReplicas: 2
+
     - id: workers
       podLabelReady:
+        # Prefer a specific selector: a broad one lists many pods on every sweep.
         selector: "app=worker"
         minReadyPods: 3
+
     - id: monitoring
       argoApplicationHealthy:
         name: monitoring-stack
+        requireSynced: true
+        requireHealthy: true
+
+    # Flux HelmReleases usually live in the namespace Flux reconciles from rather
+    # than alongside the workload, hence the namespace override -- which requires
+    # this Gate's namespace to be in platform mode and glueops-core-flux to be on
+    # gatekeeper's allowlist.
     - id: cert-manager
       namespace: glueops-core-flux
       fluxHelmReleaseReady:
         name: cert-manager
+        requireCurrentGeneration: true

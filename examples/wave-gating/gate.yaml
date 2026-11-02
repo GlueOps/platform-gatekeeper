@@ -1,0 +1,26 @@
+# Wave -1, not 0: the default wave *is* 0, so a Gate at 0 gates nothing.
+#
+# A Gate is re-evaluated on every sync, so the condition must stay true for the life
+# of the Application. Gate on steady state, not events.
+#
+# The trap is `jobComplete` on a migration: it works until ttlSecondsAfterFinished, a
+# HookSucceeded hook or a prune removes the Job, and from then on EVERY later sync of
+# this Application hangs at wave -1 -- including the commit that would fix it.
+apiVersion: platform.glueops.dev/v1alpha1
+kind: Gate
+metadata:
+  name: my-app-dependencies
+  namespace: nonprod
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+    # argocd.argoproj.io/ignore-healthcheck is deliberately NOT set; see README.
+spec:
+  checks:
+    - id: database
+      deploymentAvailable:
+        name: postgres
+        minAvailableReplicas: 1
+    - id: cache
+      serviceReadyEndpoints:
+        name: redis
+        minReadyAddresses: 1

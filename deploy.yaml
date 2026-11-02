@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+spec:
+  replicas: 1
+  # maxUnavailable: 0 so a bad image can't leave zero reconcilers.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glueops-core-gatekeeper
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: glueops-core-gatekeeper
+    spec:
+      serviceAccountName: glueops-core-gatekeeper
+      priorityClassName: system-cluster-critical
+      securityContext:
+        runAsNonRoot: true
+        # Matches the distroless:nonroot UID the Dockerfile pins.
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: gatekeeper
+          # >= v2.0.0: earlier builds never write Gate.status.
+          image: ghcr.io/glueops/platform-gatekeeper:v2.0.0 # x-release-please-version
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # Unset means no cross-namespace access at all.
+            - name: GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES
+              value: "glueops-core"
+            - name: GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES
+              value: "glueops-core-"
+            - name: GATEKEEPER_RECONCILE_INTERVAL
+              value: "30s"
+            # Below the memory limit, so growth costs GC rather than an OOMKill.
+            - name: GOMEMLIMIT
+              value: "200MiB"
+          # Process check only: staleness is an alert, not a restart.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+          # /readyz, not /healthz: healthz answers 200 before the first sweep, so a
+          # build that serves HTTP but cannot list Gates would go Ready and
+          # maxUnavailable:0 would delete the pod still reconciling.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 20m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+spec:
+  selector:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

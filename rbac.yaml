@@ -11,6 +11,7 @@ metadata:
   name: glueops-core-gatekeeper
   namespace: glueops-core-gatekeeper
 ---
+# The ceiling on what any Gate can observe. Never grant secrets or configmaps.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -18,23 +19,20 @@ metadata:
 rules:
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates"]
-    verbs: ["get"]
+    verbs: ["list"]
 
   - apiGroups: ["platform.glueops.dev"]
     resources: ["gates/status"]
-    verbs: ["patch","update"]
+    verbs: ["patch"]
 
-  - apiGroups: ["authentication.k8s.io"]
-    resources: ["tokenreviews"]
-    verbs: ["create"]
+  # Resolves the mode label on a Gate's namespace.
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get"]
 
-  - apiGroups: ["authorization.k8s.io"]
-    resources: ["subjectaccessreviews"]
-    verbs: ["create"]
-
-  # allowlisted reads:
+  # One rule per supported check type.
   - apiGroups: ["apps"]
-    resources: ["deployments","statefulsets"]
+    resources: ["deployments", "statefulsets"]
     verbs: ["get"]
 
   - apiGroups: ["batch"]
@@ -45,25 +43,21 @@ rules:
     resources: ["services"]
     verbs: ["get"]
 
-  - apiGroups: [ "" ]
-    resources: [ "pods" ]
-    verbs: [ "list" ]
-
-  - apiGroups: [ "" ]
-    resources: [ "namespaces" ]
-    verbs: [ "get" ]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["list"]
 
   - apiGroups: ["discovery.k8s.io"]
     resources: ["endpointslices"]
     verbs: ["list"]
 
-  - apiGroups: [ "argoproj.io" ]
-    resources: [ "applications" ]
-    verbs: [ "get" ]
+  - apiGroups: ["argoproj.io"]
+    resources: ["applications"]
+    verbs: ["get"]
 
-  - apiGroups: [ "helm.toolkit.fluxcd.io" ]
-    resources: [ "helmreleases" ]
-    verbs: [ "get" ]
+  - apiGroups: ["helm.toolkit.fluxcd.io"]
+    resources: ["helmreleases"]
+    verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

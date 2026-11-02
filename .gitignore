@@ -1,3 +1,6 @@
 .env
 gatekeeper
 .idea
+
+# scratch dir the Lua and promtool suites extract their scripts into
+.testtmp

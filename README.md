@@ -1,216 +1,559 @@
 # GlueOps Core Gatekeeper
 <img width="960" height="1088" alt="Gatekeeper" src="gatekeeper.png" />
 
-GlueOps Core Gatekeeper is a small Go HTTP service that acts as a **deployment dependency gate** for Kubernetes.
+Gatekeeper is a small Kubernetes controller that answers one question per app:
+**are this app's dependencies ready?**
 
-It lets applications define their own dependency checks (via a `Gate` custom resource), and provides a simple API that returns:
+You declare the dependencies in a `Gate` custom resource. Gatekeeper evaluates them
+on a timer and publishes the answer to `Gate.status`. Argo CD reads that status as
+resource health, so an ordinary sync wave holds your rollout until the dependencies
+are actually up:
 
-- **200 OK** when all checks pass (dependencies are ready)
-- **409 Conflict** when any check is not ready yet (safe to retry)
-- **4xx** for invalid specs or authorization issues
+```yaml
+# gate.yaml — applied in wave -1
+apiVersion: platform.glueops.dev/v1alpha1
+kind: Gate
+metadata:
+  name: my-app-dependencies
+  annotations:
+    argocd.argoproj.io/sync-wave: "-1"
+spec:
+  checks:
+    - id: database
+      deploymentAvailable:
+        name: postgres
+    - id: cache
+      serviceReadyEndpoints:
+        name: redis
+```
 
-This is especially useful when you need ordering logic across a mix of:
-- Argo CD-managed apps (sync waves / hooks)
-- Helm-managed components (hooks, Jobs, controllers)
-- “Out-of-band” resources not represented as Argo Applications
+Your workloads stay in the default wave and need no annotation. There is no hook
+Job, no polling script, and no per-app RBAC.
 
-A common pattern is to use an **Argo CD PreSync hook Job** to block deployment of an app until the Gatekeeper reports that prerequisites (DB, migrations, external dependencies) are ready.
-
----
-
-## Key features
-
-- **Per-app dependency definition**: each app owns a `Gate` object in its namespace.
-- **Safe-by-default multi-tenancy**:
-  - Requests authenticate via Kubernetes **ServiceAccount tokens**.
-  - Access is authorized using Kubernetes **SubjectAccessReview** (delegated authorization).
-- **Namespace policy modes** controlled by a namespace label:
-  - `customer` (default): gate lookup and checks are namespace-local
-  - `platform`: optionally allows cross-namespace checks and/or gate lookups (restricted by allowlists)
-- **Simple HTTP API** designed for hook-based retries.
+This is useful when ordering has to span things sync waves can't see on their own —
+Helm-managed components, Flux HelmReleases, other Argo CD Applications, and
+dependencies that aren't represented as Kubernetes workloads at all.
 
 ---
 
 ## How it works
 
-1. A caller (usually an Argo CD hook Job) calls Gatekeeper with its ServiceAccount token:
-   - `GET /check?gate=<gate-name>`
-2. Gatekeeper performs a `TokenReview` to authenticate the token.
-3. Gatekeeper determines the caller namespace from the ServiceAccount identity.
-4. Gatekeeper loads the `Gate` CR and evaluates each check.
-5. Each check is authorized with a `SubjectAccessReview` for the caller.
-6. Gatekeeper responds with JSON and appropriate HTTP status.
+1. Gatekeeper lists every `Gate` in the cluster every 30 seconds.
+2. For each check it reads the referenced resource and decides whether it's ready.
+3. It writes a `Ready` condition plus a per-check breakdown to `Gate.status`.
+4. Argo CD maps that condition to resource health via a Lua script, and a sync wave
+   does the ordering.
+
+Gatekeeper reads dependencies with its **own** ServiceAccount. What a Gate may
+observe is bounded by two things: the kinds granted in gatekeeper's ClusterRole, and
+the namespace rules below. Callers need no credentials and no RBAC of their own.
+
+### The rule that decides what belongs in a Gate
+
+**A Gate is re-evaluated on every sync, so the condition must stay true for the life
+of the Application — not merely become true once.** It is a managed resource in wave
+`-1` of every sync, not a one-shot precondition.
+
+Gate on steady state ("the database is available", "the dependency is healthy"), not
+on events. The classic mistake is gating on a migration Job: it works until
+something removes the Job — `ttlSecondsAfterFinished`, a `HookSucceeded` hook
+policy, Argo CD pruning, or someone deleting it to re-run the migration — and from
+then on **every** sync of that Application hangs at wave `-1`.
+
+### What this costs: readiness can be stale
+
+Gatekeeper publishes readiness rather than answering requests on demand, so a
+gatekeeper that is down or wedged leaves Gates showing their last known state.
+Neither Argo CD's health rollup nor `kubectl wait` can tell how old that state is,
+so a rollout gated on an already-`Ready` Gate can proceed on stale information.
+
+This is a deliberate trade. The dependencies normally gated here are self-healing —
+an app that starts before its database crashloops and then recovers — and it is how
+Argo CD, Flux and cert-manager all already behave. `prometheusrule.yaml` ships the
+alerts that cover it.
+
+**Where it would genuinely hurt is a gate protecting something irreversible**, such
+as a migration that an app must not start before. If you need that, say so — a
+synchronous check that fails closed is a small addition, but it isn't in the box
+today.
 
 ---
 
-## Installation
+## Install
 
-### 1) Install the CRD
-
-Apply the `Gate` CRD:
+### 1. CRD and RBAC
 
 ```bash
-kubectl apply -f crd.yaml
+kubectl apply -f crds/gates.yaml
+kubectl apply -f rbac.yaml
 ```
 
-### 2) Create Gatekeeper RBAC
+`rbac.yaml`'s ClusterRole is **the ceiling on what any Gate can observe**. A kind
+granted there becomes readable by every Gate (in its own namespace, or an allowlisted
+namespace in platform mode). Add kinds deliberately, and never grant `secrets` or
+`configmaps`.
 
-Apply Gatekeeper RBAC (TokenReview + SubjectAccessReview + read-only allowlisted resources + Gate status patch):
+### 2. The controller
 
 ```bash
-kubectl apply -f rbac.yml
+kubectl apply -f deploy.yaml
 ```
 
-### 3) Deploy the Gatekeeper service
+Set the image to a released tag pinned by digest and review the allowlist env vars
+first. **It must be v2.0.0 or later** — v1.x is the request-API build, which serves
+`/check` and never writes `Gate.status`, so Gates would sit with no condition and
+every gated Application would hang at wave `-1`.
 
-Your deployment should run with the Gatekeeper ServiceAccount and expose port 8080.
-(Provide your own deployment YAML, Helm chart, or Kustomize overlay.)
+### 3. Teach Argo CD to read a Gate — required
 
+Argo CD has no built-in health check for a `Gate`, so you give it one. This is the
+whole script — it maps the `Ready` condition onto Argo CD's health vocabulary:
 
-## Configuration
+```lua
+-- Reasons no amount of waiting can clear. See AGENTS.md Decision 15.
+local stuck = {
+  Terminal = true,
+  PolicyViolation = true,
+  ReadForbidden = true,
+  InvalidSpec = true,
+}
+hs = {}
+if obj.status == nil or obj.status.conditions == nil then
+  hs.status = "Progressing"
+  hs.message = "Awaiting first evaluation"
+  return hs
+end
+for i, c in ipairs(obj.status.conditions) do
+  if c.type == "Ready" then
+    -- Prefer the condition's own observedGeneration (metav1 binds it there).
+    local observed = c.observedGeneration or obj.status.observedGeneration
+    local generation = obj.metadata and obj.metadata.generation
+    if generation == nil or observed ~= generation then
+      hs.status = "Progressing"
+      hs.message = "Awaiting evaluation of current spec"
+      return hs
+    end
+    hs.message = (c.reason or "") .. ": " .. (c.message or "")
+    if c.status == "True" then
+      hs.status = "Healthy"
+      return hs
+    end
+    if stuck[c.reason] then
+      hs.status = "Degraded"
+      return hs
+    end
+    -- Unknown included: an unevaluable gate makes no claim either way.
+    hs.status = "Progressing"
+    return hs
+  end
+end
+hs.status = "Progressing"
+hs.message = "No Ready condition"
+return hs
+```
 
-Gatekeeper supports configuration via environment variables.
+**If `argocd-cm` is managed by the argo-cd Helm chart** (the common case), put it in
+your values under `configs.cm` and let your normal pipeline apply it:
 
-### Gate CRD location
-| Env var                    | Default                        | Description               |
-| -------------------------- | ------------------------------ | ------------------------- |
-| `GATEKEEPER_GATE_GROUP`    | `platform.glueops.dev` | API group of the Gate CRD |
-| `GATEKEEPER_GATE_VERSION`  | `v1alpha1`                     | API version               |
-| `GATEKEEPER_GATE_RESOURCE` | `gates`                        | plural resource name      |
-
-
-### Platform mode can be restricted to specific namespaces.
-
-| Env var                                          | Default                | Description                                                                           |
-| ------------------------------------------------ | ---------------------- | ------------------------------------------------------------------------------------- |
-| `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES`         | `glueops-core,nonprod` | CSV list of namespaces allowed for platform cross-namespace access                    |
-| `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES` | `glueops-core-`        | CSV list of namespace prefixes allowed (e.g. `glueops-core-` allows `glueops-core-*`) |
-
-
-### HTTP
-
-| Env var | Default | Description      |
-| ------- | ------- | ---------------- |
-| `PORT`  | `8080`  | HTTP listen port |
-
-## Namespace policy modes
-
-Gatekeeper chooses the mode based on a label on the caller’s namespace:
-
-Label key:
 ```yaml
-gatekeeper.platform.glueops.dev/mode: customer|platform
+configs:
+  cm:
+    resource.customizations.health.platform.glueops.dev_Gate: |
+      hs = {}
+      ...          # the script above, indented under this key
 ```
 
-### customer mode (default)
+**Otherwise patch the live ConfigMap** with the ready-made fragment:
 
-- Gate lookup must be in the caller namespace.
-- Checks must be in the same namespace as the Gate.
-
-This is intended for customer/self-service namespaces.
-
-### platform mode
-
-- Cross-namespace Gate lookup is allowed via ?ns=... only if the namespace is allowed by:
-  - GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES OR
-  - GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES
-- Cross-namespace checks are allowed using the same allow rules.
-
-This is intended for platform-controlled automation and core namespaces.
-
-## The Gate Custom Resource
-
-A Gate defines a list of checks. Each check must set exactly one check type.
-
-Example:
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: keycloak-prod
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: postgres
-      deploymentAvailable:
-        name: keycloak-pg-database-prod
-        minAvailableReplicas: 1
+```bash
+kubectl patch configmap argocd-cm -n argocd --type merge \
+  --patch-file examples/argocd-health-check.yaml
 ```
 
-### Supported check types
+**Use `kubectl patch`, not `kubectl apply`.** Argo CD installs with client-side
+apply, so applying a one-key `argocd-cm` manifest would three-way-merge and delete
+every other key in it — after which Argo CD selfHeals the ConfigMap back, silently
+removing this health check and un-gating every Gate in the cluster. The file is
+shipped as a patch fragment so that mistake isn't possible. If `argocd-cm` is
+managed by Helm or GitOps, add the key there instead (`configs.cm` in the argo-cd
+chart).
 
-`deploymentAvailable`
+**Without this step, Gates do nothing.** Argo CD has no built-in health check for a
+`Gate`, and a resource with no health check is *skipped* in the Application health
+rollup — the wave completes immediately and the next wave proceeds ungated.
 
-Checks a Deployment is Available and has at least N available replicas.
+**Also check `gates` isn't matched by `resource.exclusions`.** An excluded Gate is
+stripped from the target objects before the sync, so it is never applied, never
+produces a sync task, and wave 0 runs immediately — the same silent un-gating as a
+missing health check. The only signal is an `ExcludedResourceWarning` condition on
+the Application.
+
+### 4. Leave `--sync-timeout` unset — recommended
+
+`--sync-timeout` defaults to *never*, and for gated Applications that default is the
+one you want. Measured against Argo CD v3.5.6:
+
+| | What happens when a gate blocks |
+| --- | --- |
+| **unset** (default) | the operation stays `Running` and keeps re-checking the wave, so it proceeds the moment the gate clears — however long that takes |
+| **set** | the operation goes `Failed` with `Operation terminated, triggered by controller sync timeout`, **with no retries at all**, and auto-sync is then blocked for that revision |
+
+So setting it does not convert a hang into a tidy failure — it converts a *recoverable*
+hang into a wedge that needs a manual sync or a new commit. The cost of leaving it
+unset is that a gate which never clears parks the operation indefinitely, blocking
+later auto-syncs of that Application, until someone runs:
+
+```bash
+argocd app terminate-op <app>
+```
+
+If you set it anyway, it is controller-wide with no per-Application override, so a
+value below the longest legitimate sync in the cluster will start failing syncs that
+used to succeed:
+
+```bash
+kubectl patch configmap argocd-cmd-params-cm -n argocd --type merge \
+  -p '{"data":{"controller.sync.timeout.seconds":"1800"}}'
+kubectl -n argocd rollout restart statefulset/argocd-application-controller
+```
+
+The restart is required — unlike `argocd-cm`, this ConfigMap is injected as
+environment variables and is only read at pod start. Under the argo-cd Helm chart,
+set it in `configs.params` instead.
+
+### 5. Know how a failed gated sync recovers
+
+**`selfHeal` does not help here, despite what you might expect.** In `autoSync` the
+`!lastAttemptedPhase.Successful()` check returns before the selfHeal branch is
+reached, so a failed operation blocks auto-sync of that revision either way.
+
+What actually recovers a gated sync is the automated operation's own **retry budget**
+— 5 retries with exponential backoff, about 5½ minutes. Measured, with two
+Applications identical but for `selfHeal`:
+
+- Dependency fixed **inside** that window: `phase=Succeeded` ~35s later. True with
+  `selfHeal: false`.
+- Dependency fixed **after** it: both arms sat `OutOfSync`/`Failed` for 7+ minutes and
+  neither recovered. Both logged `Skipping auto-sync: failed previous sync attempt to
+  [rev] and will not retry for [rev]`.
+
+So: fix it fast and it heals itself; fix it slowly and you need a **manual sync**
+(works at the same revision) or a new commit. `argocd app terminate-op` does *not*
+help — it only releases an operation that is still `Running`.
+
+**And a wedged Application can read `Healthy`.** Once the dependency is fixed the Gate
+goes Ready, and if it's the only live resource the health rollup follows it — so you
+see `health=Healthy`, `sync=OutOfSync`, and the gated workload simply absent. Alert on
+sync status, not health.
+
+### 6. Monitoring — optional but strongly recommended
+
+```bash
+kubectl apply -f servicemonitor.yaml   # needs the Prometheus Operator
+kubectl apply -f prometheusrule.yaml
+```
+
+Two labels decide whether this works at all, and getting either wrong fails
+silently:
+
+- The alerts key on `job="glueops-core-gatekeeper"`. The shipped ServiceMonitor
+  produces exactly that. If you scrape some other way, fix the label in
+  `prometheusrule.yaml` — otherwise `absent()` is true forever on a healthy cluster,
+  the alert fires immediately and gets silenced.
+- `metadata.labels` on both files must satisfy your Prometheus's `ruleSelector` /
+  `serviceMonitorSelector`. kube-prometheus-stack defaults both to
+  `{release: <releaseName>}`, so without that label they are accepted by the
+  apiserver, appear in `kubectl get`, and are never loaded.
+
+Verify rather than assume:
+
+```bash
+# in Prometheus
+up{job="glueops-core-gatekeeper"}
+prometheus_rule_group_last_evaluation_timestamp_seconds{rule_group=~".*gatekeeper.*"}
+```
+
+---
+
+## Using it
+
+Start from [`examples/wave-gating/`](examples/wave-gating) — an Application with a
+Gate in wave `-1` and a Deployment in the default wave.
+
+Four rules that are easy to get wrong:
+
+- **Wave `-1`, not `0`.** The default wave *is* `0`, so a Gate at `0` shares a wave
+  with un-annotated resources and orders nothing.
+- **Same Application.** Sync waves only order resources within one sync, so a Gate
+  cannot gate workloads in a different Argo CD Application. For that case, a PreSync
+  Job running `kubectl wait --for=condition=Ready gate/x` works, but only if the
+  Gate already exists — PreSync runs before manifests are applied, so a Gate shipped
+  alongside the workloads won't exist yet and the wait will fail immediately.
+- **Not a PreSync hook.** Hooks are not gated at all: they run ahead of the waves
+  that contain the Gate, so a PreSync Job can be `Running` before the Gate even
+  exists. A migration — the thing you would most want gated — must go in a wave
+  after the Gate, not a hook.
+- **A blocked Gate also blocks `prune`.** With `prune: true`, removing a resource
+  from Git while the Gate is `False` pins the operation on the Gate's health and the
+  prune never runs — so you can't withdraw a gated resource while its dependency is
+  down *unless you remove the Gate too*. See Removing a Gate below.
+
+### Removing a Gate, or something it gates
+
+**Deleting a Gate from Git always works, even while it reports `False`.** A prune
+waits for the object to be *gone*, not healthy, so a Gate's own readiness is
+irrelevant to its own deletion. Drop `gate.yaml`, sync, done — the resources it was
+gating are left alone.
+
+**To withdraw a gated resource while the dependency is down, remove the Gate in the
+same commit.** That is the whole procedure. It works because Argo CD *reverses* wave
+order for prunes: the wave-`0` workload is deleted before the wave-`-1` Gate, so the
+deletion is never behind the Gate's health. Measured end to end — both resources
+pruned, operation `Succeeded`, in about five seconds.
+
+Two things that will bite you during a teardown:
+
+- **Leave at least one resource in the path.** Argo CD refuses to sync an Application
+  whose source became empty — `auto-sync will wipe out all resources` — so a commit
+  that removes *everything* does nothing at all.
+- **Don't add new resources in the same commit that removes a Gate.** The reversed
+  prune waves are a permutation of the existing wave numbers, not a negation, so they
+  land in the same numeric space as create tasks and can tie with them. A create
+  sharing the Gate's effective wave is not ordered after the Gate's deletion, and if
+  that deletion stalls the create never runs.
+
+**If you need to keep the Gate but stop it blocking:** delete its
+`argocd.argoproj.io/sync-wave` annotation in Git. The Gate then shares the default
+wave, gates nothing, and prunes proceed normally. It's a Git-side change, so no drift,
+and putting the annotation back restores gating. The cost is that the Gate stays in
+the tree reporting `Progressing`, so the Application never reads Healthy again until
+its dependency recovers.
+
+**What not to reach for.** All four measured:
+
+| Attempt | Result |
+| --- | --- |
+| `argocd app sync --prune` | **Does nothing, and looks like it's working.** It builds the same task list as auto-sync, so the wave-`-1` Gate blocks it identically — the operation sits at `Running`, not `Failed`. This is the first thing most people try |
+| `argocd app sync --prune --resource apps:Deployment:<ns>/<name>` | Works — a targeted prune drops the Gate from the task list entirely. But you must disable `automated` and terminate the stuck operation first, and it's imperative drift until the Git removal follows |
+| `kubectl delete` the gated resource | Half-works, then strands you. The resource stays gone, but the Application is left `OutOfSync/Progressing` with an operation pending indefinitely — it looks broken rather than deliberately withdrawn |
+| `kubectl delete` the Gate | **Pointless under `automated`.** Argo CD reapplies it within seconds — and a freshly created Gate has no status, which the health check reads as `Progressing / "Awaiting first evaluation"`, so it blocks immediately rather than briefly passing |
+
+### Confirming it actually gates
+
+The failure mode to rule out is a Gate that exists but gates nothing — a missing
+health check, a Gate in wave `0`, or a Gate in a different Application all look
+fine until you check. Point an Application at a Gate whose dependency is *down* and
+you should see the sync held:
+
+```console
+$ kubectl get application my-app -n argocd \
+    -o jsonpath='{.status.operationState.phase}{"\n"}{.status.operationState.message}'
+Running
+waiting for healthy state of platform.glueops.dev/Gate/my-app-dependencies
+
+$ kubectl get gates -n nonprod
+NAME                  READY   REASON                 LAST-TRANSITION
+my-app-dependencies   False   DependenciesNotReady   4m21s
+
+$ kubectl get deploy my-app -n nonprod
+Error from server (NotFound): deployments.apps "my-app" not found     # wave 0 held
+```
+
+The `waiting for healthy state of …/Gate/…` message is the proof: Argo CD is
+blocking on the Gate specifically. Then make the dependency ready, and within one
+reconcile interval:
+
+```console
+$ kubectl get gates -n nonprod
+NAME                  READY   REASON   LAST-TRANSITION
+my-app-dependencies   True    Ready    9s
+
+$ kubectl get deploy my-app -n nonprod
+NAME     READY   UP-TO-DATE   AVAILABLE   AGE
+my-app   2/2     2            2           9s
+
+$ kubectl get application my-app -n argocd \
+    -o jsonpath='{.status.health.status} {.status.sync.status} {.status.operationState.phase}'
+Healthy Synced Succeeded
+```
+
+If instead the workload appears immediately while the Gate is still `False`, the
+Gate isn't gating. Check, in order: the health check from step 3 is installed, the
+Gate is annotated `sync-wave: "-1"` and not `"0"`, the Gate is in the *same*
+Application as the workload, and `gates` isn't matched by `resource.exclusions`.
+
+### Reading status
+
+```bash
+$ kubectl get gates -A
+NAMESPACE   NAME                  READY   REASON                 LAST-TRANSITION
+nonprod     my-app-dependencies   False   DependenciesNotReady   40s
+
+$ kubectl get gate my-app-dependencies -n nonprod -o jsonpath='{.status.results}' | jq .
+[
+  {"id":"database","ready":true,"reason":"Ready","message":"deployment Available=True"},
+  {"id":"cache","ready":false,"reason":"DependenciesNotReady","message":"ready addresses 0 < 1"}
+]
+```
+
+`REASON` separates the cases that need different responses:
+
+| Reason | Status | Argo CD health | Meaning |
+| --- | --- | --- | --- |
+| `Ready` | True | Healthy | every check passed |
+| `DependenciesNotReady` | False | Progressing | still waiting; expected to resolve on its own |
+| `EvaluationFailed` | Unknown | Progressing | gatekeeper couldn't evaluate a check, so it makes no claim either way |
+| `Terminal` | False | **Degraded** | the upstream controller has given up — a failed Job, a stalled HelmRelease |
+| `PolicyViolation` | False | **Degraded** | the Gate references a namespace it isn't allowed to read |
+| `ReadForbidden` | False | **Degraded** | gatekeeper's ClusterRole is missing a kind; the message names what to grant |
+| `InvalidSpec` | False | **Degraded** | the Gate itself is malformed |
+
+The four `Degraded` reasons are the ones that **cannot clear on their own** — each
+needs someone to change something: the Gate's spec, the namespace's mode label,
+gatekeeper's ClusterRole or allowlist, or the stuck dependency itself (deleting a
+failed Job so it re-runs). The two `Progressing` ones are a gate doing its job and a
+gate that couldn't answer, neither of which should fail a sync.
+
+`Degraded` fails the sync operation, which is what makes the problem visible — the
+Application reads `Degraded` and notifications fire, rather than looking like a slow
+deploy indefinitely. The cost is that a failed operation blocks auto-sync of that
+revision once the retry budget is spent — see step 5.
+
+A `Progressing` gate has no such problem: a still-Running operation keeps re-checking
+the wave and proceeds the moment the gate clears, however long that takes. That
+self-recovery is what `Degraded` trades away for the clearer signal — a deliberate
+choice, with the reasoning in [AGENTS.md](AGENTS.md) Decision 15.
+
+Because Argo CD folds resource health into the Application's on a worst-wins basis,
+a waiting Gate shows up as the Application being `Progressing`, and any of the four
+`Degraded` reasons above as `Degraded`. Annotating a Gate
+`argocd.argoproj.io/ignore-healthcheck: "true"` removes it from that rollup while
+leaving wave gating intact (the sync engine reads the Gate's health directly and
+ignores the annotation).
+
+The shipped example deliberately does **not** set it. Measured against the same
+blocked Gate: without the annotation the Application reads `Progressing`, with it
+the Application reads `Healthy` — i.e. healthy while its declared dependency is
+down. Reach for it only if a `Degraded` Gate left in place keeping the Application
+`Degraded` is worse for you than that. In practice the reason most likely to park an
+Application there is `ReadForbidden` — a kind missing from gatekeeper's ClusterRole —
+not a failed Job.
+
+Note that `LAST-TRANSITION` is the last time the condition *changed*, not the last
+time it was evaluated — so it cannot tell you whether gatekeeper is still running.
+Use the sweep log or the metrics for that.
+
+---
+
+## The Gate resource
+
+Each check sets **exactly one** check type. The CRD enforces that, which also
+catches a misspelled type name — the API server prunes unknown fields, so without
+the check a typo would leave a Gate that looks right in Git and verifies nothing.
+(A typo *inside* a check block, like `minAvailableReplcias`, is pruned and silently
+defaulted instead; only a client using strict field validation catches that, which
+`kubectl` does by default.)
+
+A check reads from the Gate's own namespace unless it sets `namespace:`, which
+requires platform mode (below).
+
+### `deploymentAvailable`
+
+Deployment is `Available` with at least N available replicas, and its status is
+current (`observedGeneration` has caught up with `generation`).
+
 ```yaml
 - id: api
   deploymentAvailable:
     name: my-api
-    minAvailableReplicas: 2
+    minAvailableReplicas: 2   # default 1
 ```
 
-`statefulSetReady`
+### `statefulSetReady`
 
-Checks a StatefulSet has at least N ready replicas (and optionally is fully updated).
+StatefulSet has at least N ready replicas, optionally fully rolled out.
+
 ```yaml
 - id: postgres
   statefulSetReady:
     name: postgres
-    minReadyReplicas: 1
-    requireUpdatedRevision: true
+    minReadyReplicas: 1            # default 1
+    requireUpdatedRevision: true   # default true
 ```
 
-`jobComplete`
+### `jobComplete`
 
-Checks a Job has completed successfully.
+Job completed successfully. A `Failed` Job is reported as `Terminal`.
+
 ```yaml
 - id: migrate
   jobComplete:
     name: my-app-migrate
 ```
 
-`serviceReadyEndpoints`
-Checks a Service has at least N ready endpoint addresses (via EndpointSlices).
+> **Think twice before gating on this.** A Gate is re-evaluated on every sync, so
+> once the Job is garbage-collected (`ttlSecondsAfterFinished`, a `HookSucceeded`
+> hook, a prune) this check reports not-found forever and blocks every later sync.
+> See [the rule above](#the-rule-that-decides-what-belongs-in-a-gate).
+
+### `serviceReadyEndpoints`
+
+Service has at least N ready backends, counted from its EndpointSlices.
+
 ```yaml
 - id: redis
   serviceReadyEndpoints:
     name: redis
-    minReadyAddresses: 1
+    minReadyAddresses: 1   # default 1
 ```
 
-`podLabelReady`
-Checks at least N Pods matching a label selector are Ready.
+Counts ready endpoints, taking the maximum across address families — a dual-stack
+Service has an IPv4 and an IPv6 slice describing the *same* pods, so they are not
+added together.
+
+### `podLabelReady`
+
+At least N pods matching a label selector are `Ready`.
+
 ```yaml
 - id: workers
   podLabelReady:
-    selector: "app=my-worker"
-    minReadyPods: 2
+    selector: "app=my-worker,tier=backend"
+    minReadyPods: 2   # default 1
 ```
 
-> Note: If you allow very broad selectors, this may list many pods. Prefer selectors that are specific to the app.
+> Prefer a specific selector — a broad one lists many pods on every sweep.
 
-`argoApplicationHealthy`
+### `argoApplicationHealthy`
 
-Checks an Argo CD Application is Healthy and/or Synced.
+Argo CD Application is Healthy and/or Synced.
+
 ```yaml
-- id: my-app
+- id: monitoring
   argoApplicationHealthy:
-    name: my-app
-    requireSynced: true
-    requireHealthy: true
+    name: monitoring-stack
+    requireSynced: true    # default true
+    requireHealthy: true   # default true
 ```
 
-`fluxHelmReleaseReady`
+Nothing here is reported as `Terminal`. Argo CD health is a rollup over an
+Application's resources rather than a statement that its controller stopped trying:
+`Progressing` and `Degraded` both occur mid-rollout, and `Missing` is simply an
+Application whose resources aren't live yet — which is exactly what a Gate guarding
+a not-yet-bootstrapped stack should wait for.
 
-Checks a Flux `helm.toolkit.fluxcd.io/v2` HelmRelease is Ready, on the current
-generation, and not Stalled.
+### `fluxHelmReleaseReady`
+
+Flux `helm.toolkit.fluxcd.io/v2` HelmRelease is Ready, on the current generation, and
+not Stalled. A stalled release is reported as `Terminal`, because helm-controller has
+explicitly stopped retrying until the spec changes.
+
 ```yaml
 - id: cert-manager
   namespace: glueops-core-flux
   fluxHelmReleaseReady:
     name: cert-manager
-    requireCurrentGeneration: true
+    requireCurrentGeneration: true   # default true
 ```
 
 Prefer this over pointing `deploymentAvailable` at the workload a HelmRelease manages.
@@ -218,480 +561,161 @@ A Deployment check reads whatever is in the cluster right now, so during a faile
 upgrade it reports ready against the *previous* revision's pods while the release
 behind them is broken.
 
-Note that Flux HelmReleases usually live in the namespace Flux reconciles from, not
-alongside the workload — hence the `namespace` override above, which requires the
-caller's namespace to be in `platform` mode.
+Flux HelmReleases usually live in the namespace Flux reconciles from rather than
+alongside the workload, hence the `namespace` override — which needs platform mode.
 
-## HTTP API
-### GET /healthz
-
-Simple health endpoint.
-```bash
-curl -i http://gatekeeper:8080/healthz
-```
-
-### GET /check?gate=<name>
-
-Evaluates the Gate in the caller namespace (customer mode), or by default in the caller namespace (platform mode too).
-- 200 OK → all checks passed
-- 409 Conflict → at least one check is blocking (safe to retry)
-
-Example:
-```bash
-TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-curl -sS -H "Authorization: Bearer $TOKEN" \
-  "http://gatekeeper:8080/check?gate=keycloak-prod"
-```
-
-### GET /check?gate=<name>&ns=<namespace> (platform mode)
-
-In platform mode only, allows evaluating a Gate in another namespace if allowed by allowlists.
-```bash
-TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-curl -sS -H "Authorization: Bearer $TOKEN" \
-  "http://gatekeeper:8080/check?gate=keycloak-prod&ns=nonprod"
-```
-
-### GET /explain?gate=<name>[&ns=<namespace>]
-
-Same evaluation logic as /check, but always returns JSON with 200 OK (useful for debugging).
-```
-curl -sS -H "Authorization: Bearer $TOKEN" \
-  "http://gatekeeper:8080/explain?gate=keycloak-prod&ns=nonprod" | jq .
-```
-
-### JSON response format
-```json
-{
-  "gate": "keycloak-prod",
-  "namespace": "nonprod",
-  "ready": false,
-  "mode": "platform",
-  "results": [
-    {
-      "id": "postgres",
-      "ready": false,
-      "message": "availableReplicas 0 < 1"
-    }
-  ]
-}
-```
-
-## Usage patterns
-
-### Pattern 1: Simple database dependency (customer mode)
-
-Block an application deployment until its database is available.
-
-**Gate:**
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: keycloak-prod
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: postgres
-      deploymentAvailable:
-        name: keycloak-pg-database-prod
-        minAvailableReplicas: 1
-```
-
-**PreSync hook Job (minimal):**
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: gate-wait
-  namespace: nonprod
-  annotations:
-    argocd.argoproj.io/hook: PreSync
-    argocd.argoproj.io/hook-delete-policy: HookSucceeded
-spec:
-  backoffLimit: 0
-  template:
-    spec:
-      serviceAccountName: gate-waiter
-      restartPolicy: Never
-      containers:
-        - name: wait
-          image: curlimages/curl:8.5.0
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              TOKEN="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
-              until curl -sf -H "Authorization: Bearer ${TOKEN}" \
-                "http://glueops-core-gatekeeper.glueops-core-gatekeeper.svc.cluster.local:8080/check?gate=keycloak-prod"; do
-                echo "dependencies not ready yet"; sleep 5
-              done
-              echo "dependencies ready"
-```
-
-This pattern makes Argo CD wait until prerequisites are ready before continuing the sync.
-
-### Pattern 2: Migration gate (customer mode)
-
-Block an application until both the database is ready and a migration Job has completed.
-
-**Gate:**
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: my-app-ready
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: database
-      statefulSetReady:
-        name: postgres
-        minReadyReplicas: 1
-        requireUpdatedRevision: true
-    - id: migration
-      jobComplete:
-        name: my-app-migrate
-```
-
-### Pattern 3: Service mesh readiness (customer mode)
-
-Block until backing services have ready endpoints.
-
-**Gate:**
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: api-dependencies
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: redis
-      serviceReadyEndpoints:
-        name: redis
-        minReadyAddresses: 1
-    - id: workers
-      podLabelReady:
-        selector: "app=my-worker,tier=backend"
-        minReadyPods: 2
-```
-
-> Note: Prefer specific label selectors for `podLabelReady`. Broad selectors may list many pods and add API server load.
-
-### Pattern 4: Cross-namespace observability stack (platform mode)
-
-Block Grafana deployment until the full observability stack (Prometheus, Thanos, Tempo, Loki) is ready across multiple platform namespaces. This is the primary use case for platform mode with cross-namespace checks.
-
-**Gate** (in the gatekeeper’s platform namespace):
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: observability-stack-complete
-  namespace: glueops-core-gatekeeper
-spec:
-  strict: true
-  checks:
-    - id: prometheus
-      argoApplicationHealthy:
-        name: prometheus
-      namespace: glueops-core-kube-prometheus-stack
-    - id: thanos
-      argoApplicationHealthy:
-        name: thanos
-      namespace: glueops-core-thanos
-    - id: tempo
-      argoApplicationHealthy:
-        name: tempo
-      namespace: glueops-core-tempo
-    - id: loki
-      argoApplicationHealthy:
-        name: loki
-      namespace: glueops-core-loki
-```
-
-**PreSync hook Job** (with progress reporting):
-```yaml
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: wait-for-all-datasources
-  namespace: glueops-core-kube-prometheus-stack
-  annotations:
-    argocd.argoproj.io/hook: PreSync
-    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
-spec:
-  backoffLimit: 30
-  template:
-    spec:
-      serviceAccountName: grafana-gate-waiter
-      restartPolicy: OnFailure
-      containers:
-      - name: wait
-        image: alpine:3.21
-        command: ["/bin/sh", "-c"]
-        args:
-          - |
-            set -e
-            apk add --no-cache curl jq >/dev/null 2>&1
-            TOKEN=$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)
-            GATEKEEPER_URL="http://gatekeeper.glueops-core-gatekeeper.svc.cluster.local:8080"
-            GATE_NAME="observability-stack-complete"
-            GATE_NS="glueops-core-gatekeeper"
-            MAX_ATTEMPTS=60
-            ATTEMPT=0
-
-            while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
-              ATTEMPT=$((ATTEMPT + 1))
-              HTTP_CODE=$(curl -s -o /tmp/response.json -w "%{http_code}" \
-                -H "Authorization: Bearer $TOKEN" \
-                "$GATEKEEPER_URL/check?gate=$GATE_NAME&ns=$GATE_NS")
-
-              if [ "$HTTP_CODE" = "200" ]; then
-                echo "All datasources ready, proceeding with Grafana deployment"
-                exit 0
-              elif [ "$HTTP_CODE" = "409" ]; then
-                READY=$(jq ‘[.results[] | select(.ready == true)] | length’ /tmp/response.json)
-                TOTAL=$(jq ‘.results | length’ /tmp/response.json)
-                echo "[$ATTEMPT/$MAX_ATTEMPTS] $READY/$TOTAL checks ready, waiting 15s..."
-                sleep 15
-              else
-                echo "[$ATTEMPT/$MAX_ATTEMPTS] HTTP $HTTP_CODE, retrying in 20s..."
-                sleep 20
-              fi
-            done
-
-            echo "TIMEOUT: observability stack not ready"
-            exit 1
-```
-
-Platform mode requires:
-- The caller namespace has the label `gatekeeper.platform.glueops.dev/mode: platform`
-- Target namespaces are in `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES` or match `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES`
-
-### Pattern 5: Argo CD application dependency (customer mode)
-
-Block deployment until an Argo CD Application is both healthy and synced.
-
-**Gate:**
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: app-dependencies
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: auth-service
-      argoApplicationHealthy:
-        name: auth-service
-        requireSynced: true
-        requireHealthy: true
-    - id: config-db
-      deploymentAvailable:
-        name: config-db
-        minAvailableReplicas: 1
-```
-
-`argoApplicationHealthy` checks the Argo CD Application CR’s `status.health.status` (must be `"Healthy"`) and `status.sync.status` (must be `"Synced"`). Both flags default to `true` and can be independently disabled if you only care about one dimension.
-
-`fluxHelmReleaseReady` is the equivalent for a Flux-managed component. It requires the `Ready` condition to be `True`, and by default requires `status.observedGeneration` to have caught up with `metadata.generation` — otherwise the Ready condition describes a revision the controller has already superseded. `Stalled=True` is reported as its own message rather than as a generic not-ready, because the two need different responses: not-ready means keep polling, Stalled means helm-controller exhausted `spec.upgrade.remediation.retries` and will not try again until the spec, values or chart version change. A poller that cannot tell them apart spends its whole timeout on a release that was never going to recover.
-
-### Pattern 6: Mixed check types
-
-A single Gate can combine any check types. Each check must set exactly one type.
-
-**Gate:**
-```yaml
-apiVersion: platform.glueops.dev/v1alpha1
-kind: Gate
-metadata:
-  name: full-stack-ready
-  namespace: nonprod
-spec:
-  strict: true
-  checks:
-    - id: database
-      statefulSetReady:
-        name: postgres
-        minReadyReplicas: 1
-    - id: migration
-      jobComplete:
-        name: db-migrate
-    - id: cache
-      serviceReadyEndpoints:
-        name: redis
-        minReadyAddresses: 1
-    - id: api
-      deploymentAvailable:
-        name: api-server
-        minAvailableReplicas: 2
-    - id: workers
-      podLabelReady:
-        selector: "app=worker"
-        minReadyPods: 3
-    - id: monitoring
-      argoApplicationHealthy:
-        name: monitoring-stack
-```
-
-### strict vs non-strict mode
-
-When `spec.strict` is `true` (the default), any check failure immediately fails the entire Gate. When `false`, invalid or policy-violating checks are skipped, and the Gate can still pass if all remaining checks pass. Use `strict: false` only when some checks are optional or expected to be temporarily unavailable.
-
-## RBAC / Authorization model
-
-Gatekeeper uses delegated authorization:
-- The caller’s ServiceAccount must have RBAC permissions to read the resources referenced in the Gate checks.
-- Gatekeeper verifies permissions with SubjectAccessReview before reading.
-- Only `get` is needed for named resources (Deployments, StatefulSets, Jobs, Services, Argo Applications). Only `list` is needed for collection queries (Pods, EndpointSlices).
-- Gatekeeper itself does **not** need `list` or `watch` — it fetches each resource individually by name from the Gate spec.
-
-### Caller SA RBAC: only include what your Gate checks need
-
-Grant only the RBAC rules that match the check types used in your Gate. For example, if your Gate only uses `deploymentAvailable` and `argoApplicationHealthy`, you only need:
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: grafana-gate-waiter
-  namespace: nonprod
-rules:
-  - apiGroups: ["apps"]
-    resources: ["deployments"]
-    verbs: ["get"]
-  - apiGroups: ["argoproj.io"]
-    resources: ["applications"]
-    verbs: ["get"]
-  - apiGroups: ["platform.glueops.dev"]
-    resources: ["gates"]
-    verbs: ["get"]
-```
-
-### Full RBAC reference by check type
-
-| Check type | API group | Resource | Verb |
-| --- | --- | --- | --- |
-| `deploymentAvailable` | `apps` | `deployments` | `get` |
-| `statefulSetReady` | `apps` | `statefulsets` | `get` |
-| `jobComplete` | `batch` | `jobs` | `get` |
-| `serviceReadyEndpoints` | (core) | `services` | `get` |
-| `serviceReadyEndpoints` | `discovery.k8s.io` | `endpointslices` | `list` |
-| `podLabelReady` | (core) | `pods` | `list` |
-| `argoApplicationHealthy` | `argoproj.io` | `applications` | `get` |
-| (all Gates) | `platform.glueops.dev` | `gates` | `get` |
-
-### Example: full Role covering all check types
-
-```yaml
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: gate-waiter-read
-  namespace: nonprod
-rules:
-  - apiGroups: ["platform.glueops.dev"]
-    resources: ["gates"]
-    verbs: ["get"]
-  - apiGroups: ["apps"]
-    resources: ["deployments","statefulsets"]
-    verbs: ["get"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["services"]
-    verbs: ["get"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["list"]
-  - apiGroups: ["discovery.k8s.io"]
-    resources: ["endpointslices"]
-    verbs: ["list"]
-  - apiGroups: ["argoproj.io"]
-    resources: ["applications"]
-    verbs: ["get"]
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: gate-waiter-read
-  namespace: nonprod
-subjects:
-  - kind: ServiceAccount
-    name: gate-waiter
-    namespace: nonprod
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: gate-waiter-read
+
+## Namespace modes
+
+A Gate's namespace decides whether its checks may look outside that namespace. The
+mode comes from a label on the namespace, which only the platform team can set:
+
+```yaml
+gatekeeper.platform.glueops.dev/mode: customer|platform
 ```
 
-## Local development
+**`customer` (the default, including unlabelled namespaces)** — every check reads
+from the Gate's own namespace. A `namespace:` override is refused with
+`PolicyViolation`.
 
-Run locally against a cluster. Update / create `.env` file (see `.env.example`):
-```text
-GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES="glueops-core-"
-GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES="glueops-core,nonprod"
-KUBECONFIG=~/.kube/config
-```
-```bash
-go run .
-```
+**`platform`** — checks may target another namespace, but only if it matches
+`GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES` or one of
+`GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES`. Anything else is refused.
 
-### Run tests
+Both lists are **empty by default**, so a deployment that omits them gets no
+cross-namespace access rather than a silently working allowlist.
 
-```bash
-go test ./...
-```
+Note that the allowlist is global: any platform-mode namespace can reach every
+allowlisted namespace. "Who can create Gates in a platform-mode namespace" is
+therefore a privileged grant.
 
-### Test with a ServiceAccount token
+---
 
-For example, to test platform mode from a platform namespace:
-```bash
-NS=glueops-core-gatekeeper
-SA=glueops-core-gatekeeper
-TOKEN=$(kubectl -n "$NS" create token "$SA" --duration=10m)
+## Configuration
 
-curl -sS -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/check?gate=keycloak-prod&ns=nonprod" | jq .
-```
+| Env var | Default | Description |
+| --- | --- | --- |
+| `GATEKEEPER_RECONCILE_INTERVAL` | `30s` | How often to re-evaluate every Gate. Minimum 1s; anything lower or unparseable falls back to the default. To stop reconciling, scale the Deployment to 0. |
+| `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES` | *(empty)* | CSV of namespaces platform-mode Gates may read from |
+| `GATEKEEPER_PLATFORM_ALLOWED_NAMESPACE_PREFIXES` | *(empty)* | CSV of namespace prefixes, e.g. `glueops-core-` |
+| `PORT` | `8080` | HTTP port for `/healthz` and `/metrics` |
+| `GOMEMLIMIT` | *(unset)* | Standard Go setting; `deploy.yaml` sets it below the memory limit so growth costs GC rather than an OOMKill |
 
-If you get a 403:
-- verify the caller SA has RBAC to read the referenced resources (or intentionally doesn’t)
-- verify the target namespace is allowed by GATEKEEPER_PLATFORM_ALLOWED_NAMESPACES/..._PREFIXES
+### Endpoints
+
+- `GET /healthz` — plain process check, for the kubelet probe. It deliberately does
+  **not** report sweep health: tying liveness to sweep success would turn an apiserver
+  outage into CrashLoopBackOff, and a restarting pod reconciles less than a wedged one.
+- `GET /metrics` — exports:
+  - `gatekeeper_last_successful_sweep_timestamp_seconds` — last sweep that listed the
+    Gates and wrote a status to every one of them.
+  - `gatekeeper_gates_unevaluated` — Gates whose last evaluation reached no verdict.
+  - `gatekeeper_sweep_duration_seconds` — wall time of the last sweep; distinguishes
+    a slow sweep from a wedged one.
+
+---
+
+## Upgrading from an earlier build
+
+The `Gate` schema changed incompatibly, which is what `v1alpha1` is for — the
+version is unchanged, so `kubectl apply -f crds/gates.yaml` works in place. There is no
+`status.storedVersions` migration and nothing to convert: the apiserver prunes
+removed fields such as `spec.strict` from Gates already in the cluster.
+
+What does change for anyone who had Gates before:
+
+- **`spec.strict` is gone.** Old manifests are rejected with an unknown-field error
+  by any client using strict field validation, which includes `kubectl` by default
+  and Argo CD's server-side apply. Delete the field.
+- **Hook Jobs that called `/check` or `/explain` will fail**, because those
+  endpoints no longer exist. Replace each one with the `sync-wave: "-1"` annotation
+  on the Gate (see [Using it](#using-it)), and delete the Job along with its
+  ServiceAccount, Role and RoleBinding.
+- **The Argo CD health check in step 3 is new and required.** Without it a Gate
+  gates nothing, silently. Steps 4 and 5 are not prerequisites — they describe how
+  a gated sync behaves, and the defaults are the right starting point.
 
 ## Troubleshooting
 
-### jq: parse error
+**A Gate never leaves `DependenciesNotReady`.** Read `status.results` — it names the
+check and why. Each message describes the actual resource state
+(`availableReplicas 0 < 1`).
 
-You are likely receiving a plain-text error response. Run with -i to see the status code:
+**A Gate says `ReadForbidden`.** Gatekeeper's ClusterRole is missing a kind the Gate
+references. The message names it, e.g. `grant batch/jobs in its ClusterRole`.
+
+**A Gate says `PolicyViolation`.** The check targets another namespace from a
+`customer`-mode namespace, or from a platform-mode namespace to a target that isn't
+allowlisted. The message names the target.
+
+**A Gate says `EvaluationFailed`.** Gatekeeper couldn't complete a read — usually a
+transient API error. The condition is `Unknown` rather than `False` on purpose: it is
+not a claim that the dependency is unready. The message carries only the API error's
+reason (`Timeout`, `ServiceUnavailable`, …); the full error is in gatekeeper's log:
+`kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper | grep read`.
+
+**A sync hangs and the Gate looks healthy.** Check that the Lua health check from
+step 3 is actually installed; without it Argo CD ignores the Gate entirely, the wave
+task succeeds immediately, and the rollout proceeds ungated with *no* warning
+anywhere — the Gate simply reports empty health and the Application reads Healthy.
+This is the quietest way to break gating. A *syntax error* in the script is the
+opposite: the operation goes `phase=Error` with a parse error and nothing is created.
+
+**A sync is stuck Running and won't pick up new commits.** That's the
+`--sync-timeout` default from step 4. Release it with
+`argocd app terminate-op <app>`.
+
+**The dependency is fixed, the Gate reads `Ready`, but the Application stays
+`OutOfSync` and nothing deploys.** The previous sync *failed*, and a failed operation
+blocks auto-sync of that revision — `Skipping auto-sync: failed previous sync attempt
+… and will not retry`. `terminate-op` won't help, there is no operation to terminate.
+It self-heals only if you fix the dependency inside the retry budget (~5½ min, see
+step 5); past that, run a manual sync or push a commit.
+
+**A migration ran before its gate.** PreSync hooks are not gated. Hooks run ahead of
+the waves that contain the Gate, so at the moment a PreSync Job starts the Gate may
+not even exist yet. Move the work into a wave after the Gate instead of a PreSync
+hook.
+
+**Is gatekeeper actually running?** Not answerable from `kubectl get gates` —
+`LAST-TRANSITION` is deliberately inherited, so a Gate that has been Ready for days
+looks identical whether it was evaluated seconds or hours ago. Use:
+
 ```bash
-curl -i -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/check?gate=keycloak-prod&ns=nonprod"
+kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper --tail=20 | grep sweep:
 ```
 
-### 403 forbidden with SubjectAccessReview
+**`GatekeeperNotReconciling` is firing.** Gate readiness is stale, so gated rollouts
+may have proceeded without their dependencies being verified. Check the Deployment,
+confirm sweeps are completing with the command above, and once recovered review which
+gated Applications synced during the window.
 
-The caller ServiceAccount does not have permission to read a resource referenced by a check.
+**`GatekeeperGatesUnevaluated` is firing.** Some Gates are stuck at `Ready=Unknown`,
+so gated rollouts are *waiting* rather than proceeding. Find them with
+`kubectl get gates -A | grep Unknown` and read `.status.results`.
 
-Fix by granting minimal RBAC in the namespace for that SA (see RBAC reference table above). Only grant the verbs/resources needed by the check types in your Gate.
+---
 
-### 404 gate not found
+## Local development
 
-The Gate name or namespace is wrong, or you are calling without &ns= in platform mode.
+Everything runs in Docker; no Go toolchain needed on the host.
 
-### 409 conflict (not ready)
-
-This is normal — it means at least one check is not ready yet. Use the `/explain` endpoint to see which checks are blocking:
 ```bash
-curl -sS -H "Authorization: Bearer $TOKEN" \
-  "http://localhost:8080/explain?gate=my-gate&ns=nonprod" | jq .
+# build, vet and test
+docker run --rm -v "$PWD":/w -w /w golang:1.26-alpine \
+  sh -c 'go build ./... && go vet ./... && go test ./...'
+
+# -race needs cgo, so use the Debian image
+docker run --rm -v "$PWD":/w -w /w golang:1.26 go test -race ./...
+
+# container image
+docker build -t gatekeeper .
 ```
 
+Two more suites live in `examples/argocd-health-check_test.lua` and
+`prometheusrule_test.yaml`; CI runs all three, and each file's header has its commands.
+
+To run it against a cluster, point `KUBECONFIG` at one and see `.env.example`.
+End-to-end instructions, including a throwaway k3d cluster, are in
+[AGENTS.md](AGENTS.md).

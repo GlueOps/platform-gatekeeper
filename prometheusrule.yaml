@@ -1,0 +1,66 @@
+# Optional; needs the Prometheus Operator. These alerts are the whole staleness
+# mitigation -- see AGENTS.md Decision 2.
+#
+# TWO THINGS MUST LINE UP or the mitigation is silently absent:
+#   1. `job=` below must match your scrape config. servicemonitor.yaml yields this.
+#   2. metadata.labels must satisfy your Prometheus's ruleSelector
+#      (kube-prometheus-stack defaults to `{release: <releaseName>}`).
+#
+# promtool tests: prometheusrule_test.yaml
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+    # release: kube-prometheus-stack   # uncomment to match a default ruleSelector
+spec:
+  groups:
+    - name: glueops-core-gatekeeper
+      rules:
+        # Three arms: stale gauge (wedged sweep), up==0 (pod unscrapable -- absent()
+        # does NOT cover it), absent (target gone). max() keeps one labelset so a
+        # change of firing arm doesn't restart `for`. 300s because sweeps are serial.
+        - alert: GatekeeperNotReconciling
+          expr: >-
+            max(time() - gatekeeper_last_successful_sweep_timestamp_seconds{job="glueops-core-gatekeeper"}) > 300
+            or max(up{job="glueops-core-gatekeeper"}) == 0
+            or max(absent(up{job="glueops-core-gatekeeper"})) > 0
+          for: 2m
+          labels:
+            severity: warning
+          annotations:
+            summary: Gatekeeper is not publishing Gate readiness
+            description: >-
+              Gate readiness is stale, so deployments gated on an already-Ready Gate
+              may proceed without their dependencies being verified. Check the
+              gatekeeper Deployment in glueops-core-gatekeeper, then confirm sweeps
+              are completing with
+              `kubectl logs -n glueops-core-gatekeeper deploy/glueops-core-gatekeeper --tail=20 | grep sweep:`
+              (note that `kubectl get gates` will NOT show this: LAST-TRANSITION is
+              deliberately inherited, so a Gate that has been Ready for days looks
+              identical whether it was evaluated seconds or hours ago). Once
+              recovered, review which gated Applications synced during the window.
+              An Argo CD sync stuck waiting on a gate is released with
+              `argocd app terminate-op <app>`.
+
+        # Sweeps succeed but no Gate has a usable answer, so the alert above stays
+        # quiet. Patient: one Gate Unknown for one sweep is a normal transient.
+        - alert: GatekeeperGatesUnevaluated
+          expr: max(gatekeeper_gates_unevaluated{job="glueops-core-gatekeeper"}) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: Gatekeeper cannot evaluate some Gates
+            description: >-
+              One or more Gates have been stuck with Ready=Unknown. Gated rollouts
+              are waiting rather than proceeding, so this blocks deploys rather than
+              risking them. Find the affected Gates with
+              `kubectl get gates -A | grep Unknown` and read `.status.results` for
+              the reason: the API server rejecting gatekeeper's reads, or a
+              dependency whose status cannot be interpreted. Note a missing kind in
+              gatekeeper's ClusterRole does NOT show up here -- that is
+              ReadForbidden, which is Ready=False and surfaces as a Degraded
+              Application instead.

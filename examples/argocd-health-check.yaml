@@ -1,0 +1,52 @@
+# Argo CD health check for Gate resources. Applied once per Argo CD instance.
+#
+#   kubectl patch configmap argocd-cm -n argocd --type merge \
+#     --patch-file examples/argocd-health-check.yaml
+#
+# Patch, not apply: this is a fragment, and `kubectl apply` of a one-key argocd-cm
+# would delete every other key in it. Helm-managed argocd-cm goes in `configs.cm`.
+#
+# Required, not optional -- see README's install step 3 and AGENTS.md Decision 4.
+# Test changes with argocd-health-check_test.lua (CI runs it).
+data:
+  resource.customizations.health.platform.glueops.dev_Gate: |
+    -- Reasons no amount of waiting can clear. See AGENTS.md Decision 15.
+    local stuck = {
+      Terminal = true,
+      PolicyViolation = true,
+      ReadForbidden = true,
+      InvalidSpec = true,
+    }
+    hs = {}
+    if obj.status == nil or obj.status.conditions == nil then
+      hs.status = "Progressing"
+      hs.message = "Awaiting first evaluation"
+      return hs
+    end
+    for i, c in ipairs(obj.status.conditions) do
+      if c.type == "Ready" then
+        -- Prefer the condition's own observedGeneration (metav1 binds it there).
+        local observed = c.observedGeneration or obj.status.observedGeneration
+        local generation = obj.metadata and obj.metadata.generation
+        if generation == nil or observed ~= generation then
+          hs.status = "Progressing"
+          hs.message = "Awaiting evaluation of current spec"
+          return hs
+        end
+        hs.message = (c.reason or "") .. ": " .. (c.message or "")
+        if c.status == "True" then
+          hs.status = "Healthy"
+          return hs
+        end
+        if stuck[c.reason] then
+          hs.status = "Degraded"
+          return hs
+        end
+        -- Unknown included: an unevaluable gate makes no claim either way.
+        hs.status = "Progressing"
+        return hs
+      end
+    end
+    hs.status = "Progressing"
+    hs.message = "No Ready condition"
+    return hs

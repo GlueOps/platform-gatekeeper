@@ -1,0 +1,181 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: gates.platform.glueops.dev
+spec:
+  group: platform.glueops.dev
+  scope: Namespaced
+  names:
+    plural: gates
+    singular: gate
+    kind: Gate
+    shortNames: ["gate"]
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      subresources:
+        status: {}
+      additionalPrinterColumns:
+        - name: Ready
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].status
+        - name: Reason
+          type: string
+          jsonPath: .status.conditions[?(@.type=="Ready")].reason
+        - name: Last-Transition
+          type: date
+          jsonPath: .status.conditions[?(@.type=="Ready")].lastTransitionTime
+        # Declaring any column replaces the default table, which included Age.
+        - name: Age
+          type: date
+          jsonPath: .metadata.creationTimestamp
+      schema:
+        openAPIV3Schema:
+          type: object
+          required: ["spec"]
+          properties:
+            spec:
+              type: object
+              required: ["checks"]
+              properties:
+                checks:
+                  description: >-
+                    Dependencies that must all be ready. Each entry sets exactly one
+                    check type; ids must be unique.
+                  type: array
+                  minItems: 1
+                  # A cap is required -- CEL cost estimation multiplies per-item cost
+                  # by maxItems and an unbounded list is rejected at apply time -- but
+                  # the value is ours to pick: measured, the rule fits well inside the
+                  # budget here.
+                  maxItems: 256
+                  # Keyed so two checks cannot share an id, which would otherwise
+                  # collide in the status.results breakdown.
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: ["id"]
+                  items:
+                    type: object
+                    required: ["id"]
+                    # Catches a misspelled check type, which pruning would other-
+                    # wise turn into a check that silently verifies nothing.
+                    x-kubernetes-validations:
+                      # |- with every line at the block indent, not >-: a folded
+                      # scalar whose continuations are indented further keeps literal
+                      # newlines, and kustomize then re-emits it with an extra one, so
+                      # the bundle and a direct kubectl apply install different rule
+                      # strings and flip the field on every apply.
+                      - rule: |-
+                          [has(self.deploymentAvailable), has(self.statefulSetReady),
+                          has(self.jobComplete), has(self.serviceReadyEndpoints),
+                          has(self.podLabelReady), has(self.argoApplicationHealthy),
+                          has(self.fluxHelmReleaseReady)].exists_one(x, x)
+                        message: "each check must set exactly one check type"
+                    properties:
+                      id:
+                        type: string
+                        minLength: 1
+                        maxLength: 63
+                      # Defaults to the Gate's namespace; cross-namespace needs
+                      # platform mode and an allowlisted target.
+                      namespace:
+                        type: string
+                        minLength: 1
+                        maxLength: 63
+
+                      # Exactly one of the blocks below must be set.
+                      deploymentAvailable:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minAvailableReplicas: { type: integer, minimum: 0, default: 1 }
+
+                      statefulSetReady:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minReadyReplicas: { type: integer, minimum: 0, default: 1 }
+                          requireUpdatedRevision: { type: boolean, default: true }
+
+                      jobComplete:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+
+                      serviceReadyEndpoints:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          minReadyAddresses: { type: integer, minimum: 0, default: 1 }
+
+                      podLabelReady:
+                        type: object
+                        required: ["selector"]
+                        properties:
+                          selector: { type: string, minLength: 1 } # label selector string
+                          minReadyPods: { type: integer, minimum: 0, default: 1 }
+
+                      argoApplicationHealthy:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          requireSynced: { type: boolean, default: true }
+                          requireHealthy: { type: boolean, default: true }
+
+                      # Prefer over deploymentAvailable on a Helm-managed workload:
+                      # that reads ready off the previous revision's pods.
+                      fluxHelmReleaseReady:
+                        type: object
+                        required: ["name"]
+                        properties:
+                          name: { type: string, minLength: 1 }
+                          # False trusts a Ready condition from an older revision.
+                          requireCurrentGeneration: { type: boolean, default: true }
+
+            status:
+              type: object
+              properties:
+                observedGeneration: { type: integer, minimum: 0 }
+                conditions:
+                  type: array
+                  # list-map keying rejects a duplicate Ready condition.
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: ["type"]
+                  items:
+                    type: object
+                    # Mirrors metav1.Condition.
+                    required: ["type", "status", "reason", "message", "lastTransitionTime"]
+                    properties:
+                      type: { type: string, minLength: 1, maxLength: 316 }
+                      status:
+                        type: string
+                        enum: ["True", "False", "Unknown"]
+                      reason:
+                        type: string
+                        minLength: 1
+                        maxLength: 1024
+                        pattern: '^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$'
+                      message: { type: string, maxLength: 32768 }
+                      lastTransitionTime: { type: string, format: date-time }
+                      observedGeneration: { type: integer, minimum: 0 }
+                results:
+                  description: Per-check verdicts from the last evaluation, one per spec.checks entry.
+                  type: array
+                  x-kubernetes-list-type: map
+                  x-kubernetes-list-map-keys: ["id"]
+                  items:
+                    type: object
+                    required: ["id", "ready"]
+                    properties:
+                      id: { type: string }
+                      ready: { type: boolean }
+                      reason: { type: string }
+                      message: { type: string }
+                      terminal:
+                        description: The dependency cannot become ready without a change; stop waiting.
+                        type: boolean

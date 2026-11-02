@@ -1,0 +1,26 @@
+# The Gate and what it gates must be in the SAME Application; waves only order
+# within one sync.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/your-org/your-manifests
+    targetRevision: main
+    path: apps/my-app
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: nonprod
+  syncPolicy:
+    # Without this both resources fail to apply on a cluster that has no `nonprod`,
+    # so nothing is gated.
+    syncOptions:
+      - CreateNamespace=true
+    automated:
+      prune: true
+      # Note selfHeal does NOT rescue a sync that failed on a gate; the automated
+      # operation's own retry budget (~5.5 min) is what does. See README step 5.
+      selfHeal: true

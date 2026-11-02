@@ -1,0 +1,18 @@
+# Optional; needs the Prometheus Operator. Pins the `job` label prometheusrule.yaml
+# keys on. metadata.labels must satisfy your serviceMonitorSelector.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: glueops-core-gatekeeper
+  namespace: glueops-core-gatekeeper
+  labels:
+    app.kubernetes.io/name: glueops-core-gatekeeper
+    # release: kube-prometheus-stack   # uncomment to match a default selector
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: glueops-core-gatekeeper
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
