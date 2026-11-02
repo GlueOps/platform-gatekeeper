@@ -18,7 +18,8 @@
   "packages": {
     ".": {
       "release-type": "go",
-      "package-name": "platform-gatekeeper"
+      "package-name": "platform-gatekeeper",
+      "extra-files": ["deploy.yaml"]
     }
   }
 }
